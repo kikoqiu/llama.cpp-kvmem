@@ -187,6 +187,9 @@ struct quantize_state_impl {
     // tensor type override patterns (compiled once, used twice)
     std::vector<std::pair<std::regex, ggml_type>> tensor_type_patterns;
 
+    // optional gguf from which tensors are copied byte-for-byte (tensor override / merge)
+    struct gguf_context * tensor_override_ctx = nullptr;
+
     quantize_state_impl(const llama_model & model, const llama_model_quantize_params * params):
         model(model), params(params)
     {
@@ -207,7 +210,30 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    bool            override_copy       = false; // copy byte-for-byte from tensor_override_ctx
+    int64_t         tensor_override_idx = -1;    // index in tensor_override_ctx
 };
+
+// returns true if the tensor name matches any --tensor-type override pattern
+static bool tensor_has_manual_override(const quantize_state_impl & qs, const char * tensor_name) {
+    if (qs.tensor_type_patterns.empty()) {
+        return false;
+    }
+    for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+        if (std::regex_search(tensor_name, pattern)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// returns the index of the tensor in the override gguf, or -1 if it should not be copied from there
+static int64_t tensor_override_index(const quantize_state_impl & qs, const char * tensor_name) {
+    if (qs.tensor_override_ctx == nullptr || tensor_has_manual_override(qs, tensor_name)) {
+        return -1;
+    }
+    return gguf_find_tensor(qs.tensor_override_ctx, tensor_name);
+}
 
 //
 // dequantization
@@ -951,6 +977,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     quantize_state_impl qs(*model, params);
 
+    // optionally load a gguf to copy tensors from (tensor override / merge)
+    if (params->tensor_override_file) {
+        gguf_init_params iparams = { /*no_alloc =*/ true, /*ctx =*/ nullptr };
+        qs.tensor_override_ctx = gguf_init_from_file(params->tensor_override_file, iparams);
+        if (!qs.tensor_override_ctx) {
+            throw std::runtime_error(format("failed to load tensor override file '%s'", params->tensor_override_file));
+        }
+    }
+
     if (params->only_copy) {
         ftype = ml.ftype;
     }
@@ -1086,7 +1121,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         metadata[i].allows_quantization = tensor_allows_quantization(params, model->arch, tensor);
 
-        if (metadata[i].allows_quantization) {
+        const int64_t idx_ovr = tensor_override_index(qs, tensor->name);
+        if (idx_ovr >= 0) {
+            metadata[i].override_copy        = true;
+            metadata[i].tensor_override_idx  = idx_ovr;
+            metadata[i].target_type          = gguf_get_tensor_type(qs.tensor_override_ctx, idx_ovr);
+        } else if (metadata[i].allows_quantization) {
             metadata[i].target_type = llama_tensor_get_type(qs, params, tensor, default_type, metadata[i]);
         } else {
             metadata[i].target_type = tensor->type;
@@ -1134,6 +1174,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     int cur_split = -1;
     std::ofstream fout;
+    std::ifstream ovr_file;
+    if (qs.tensor_override_ctx) {
+        ovr_file.open(params->tensor_override_file, std::ios::binary);
+        if (!ovr_file.is_open()) {
+            throw std::runtime_error(format("failed to open tensor override file '%s'", params->tensor_override_file));
+        }
+    }
     auto close_ofstream = [&]() {
         // Write metadata and close file handler
         if (fout.is_open()) {
@@ -1207,7 +1254,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
-            if (quantize) {
+            if (tm.override_copy) {
+                new_size = gguf_get_tensor_size(qs.tensor_override_ctx, tm.tensor_override_idx);
+                LLAMA_LOG_INFO("size = %8.3f MiB (override %s)\n", new_size/1024.0/1024.0, ggml_type_name(new_type));
+            } else if (quantize) {
                 new_size = ggml_nrows(tensor) * ggml_row_size(new_type, tensor->ne[0]);
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (%s)\n",
                                tensor_size/1024.0/1024.0,
@@ -1225,7 +1275,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             continue;
         } else {
             // no --dry-run, perform quantization
-            if (!quantize) {
+            if (tm.override_copy) {
+                const size_t ovr_size = gguf_get_tensor_size(qs.tensor_override_ctx, tm.tensor_override_idx);
+                const size_t ovr_offs = gguf_get_data_offset(qs.tensor_override_ctx) + gguf_get_tensor_offset(qs.tensor_override_ctx, tm.tensor_override_idx);
+                if (read_data.size() < ovr_size) {
+                    read_data.resize(ovr_size);
+                }
+                ovr_file.seekg(ovr_offs);
+                ovr_file.read((char *) read_data.data(), ovr_size);
+                if (!ovr_file) {
+                    throw std::runtime_error(format("failed to read override tensor '%s'", tensor->name));
+                }
+                if (!ggml_validate_row_data(new_type, read_data.data(), ovr_size)) {
+                    throw std::runtime_error(format("override tensor '%s' has invalid data", tensor->name));
+                }
+                fout.write((const char *) read_data.data(), ovr_size);
+                new_size = ovr_size;
+                LLAMA_LOG_INFO("size = %8.3f MiB (override %s)\n", ovr_size/1024.0/1024.0, ggml_type_name(new_type));
+            } else if (!quantize) {
                 new_size = tensor_size;
                 LLAMA_LOG_INFO("size = %8.3f MiB\n", tensor_size/1024.0/1024.0);
 
@@ -1334,7 +1401,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             zeros(fout, GGML_PAD(new_size, align) - new_size);
 
             // unmap the tensor to free memory
-            if (ml.use_mmap) { ml.unmap_weight(weight); }
+            if (ml.use_mmap && !tm.override_copy) { ml.unmap_weight(weight); }
 
         } // no --dry-run
     } // main loop
@@ -1378,6 +1445,7 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
         /*.prune_layers                =*/ nullptr,
+        /*.tensor_override_file        =*/ nullptr,
         /*.max_buf_size                =*/ LLAMA_QUANT_MAX_BUF_SIZE
     };
 
