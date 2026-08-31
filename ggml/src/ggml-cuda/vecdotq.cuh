@@ -479,6 +479,48 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
     return d3 * sumf;
 }
 
+// vdr = 2 variant: one thread covers two adjacent 16-element sub-blocks (iqs and iqs + 1),
+// i.e. 32 elements. Both sub-blocks share the same y blocks (bq8_offset) and the same
+// 4 scale values + 4 q8_1 block scales, so the scale unpack and d8 loads happen once.
+// Two accumulators keep the two dp4a/FMA chains independent (better ILP on issue-bound parts).
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq_vdr2(
+    const int & vl0, const int & vh0, const int & vl1, const int & vh1,
+    const int * __restrict__ u0, const int * __restrict__ u1,
+    const uint8_t * __restrict__ scales, const int & scale_offset,
+    const float & d3, const float * __restrict__ d8) {
+
+    float sumf0 = 0.0f;
+    float sumf1 = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int isc = scale_offset + 2*i;
+
+        const int isc_low = isc % (QK_K/32);
+        const int sc_shift_low = 4 * (isc / (QK_K/32));
+        const int sc_low  = (scales[isc_low] >> sc_shift_low) & 0xF;
+
+        const int isc_high = isc % (QK_K/64);
+        const int sc_shift_high = 2 * (isc / (QK_K/64));
+        const int sc_high = ((scales[(QK_K/32) + isc_high] >> sc_shift_high) & 3) << 4;
+
+        const int sc = (sc_low | sc_high) - 32;
+
+        const int vil0 = (vl0 >> (2*i)) & 0x03030303;
+        const int vih0 = ((vh0 >> i) << 2) & 0x04040404;
+        const int vi0 = __vsubss4(vil0, vih0);
+
+        const int vil1 = (vl1 >> (2*i)) & 0x03030303;
+        const int vih1 = ((vh1 >> i) << 2) & 0x04040404;
+        const int vi1 = __vsubss4(vil1, vih1);
+
+        sumf0 += d8[i] * (ggml_cuda_dp4a(vi0, u0[i], 0) * sc); // SIMD dot product
+        sumf1 += d8[i] * (ggml_cuda_dp4a(vi1, u1[i], 0) * sc); // SIMD dot product
+    }
+
+    return d3 * (sumf0 + sumf1);
+}
+
 // contiguous v/x + u/y values
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
     const int * __restrict__ v, const int * __restrict__ u, const int8_t * __restrict__ scales,
@@ -888,6 +930,75 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
     return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
 }
 
+// vdr = 2 variant: one thread covers two adjacent 16-element sub-blocks (iqs and iqs + 1),
+// i.e. 32 elements. Both sub-blocks share the same y blocks (bq8_offset), the same scale
+// bytes and the same 4 q8_1 block scales, so the scale unpack and d8 loads happen once.
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq_vdr2(
+    const int & v0, const int & v1,
+    const int * __restrict__ u0, const int * __restrict__ u1,
+    const uint8_t * __restrict__ scales, const half2 & dm2, const float * __restrict__ d8) {
+
+    float sumf_d0 = 0.0f;
+    float sumf_d1 = 0.0f;
+    float sumf_m0 = 0.0f;
+    float sumf_m1 = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        const int sc = scales[2*i];
+
+        const int vi0 = (v0 >> (2*i)) & 0x03030303;
+        const int vi1 = (v1 >> (2*i)) & 0x03030303;
+
+        sumf_d0 += d8[i] * (ggml_cuda_dp4a(vi0, u0[i], 0) * (sc & 0xF)); // SIMD dot product
+        sumf_d1 += d8[i] * (ggml_cuda_dp4a(vi1, u1[i], 0) * (sc & 0xF));
+
+        // fill int with 4x m
+        int m = sc >> 4;
+        m |= m <<  8;
+        m |= m << 16;
+        sumf_m0 += d8[i] * ggml_cuda_dp4a(m, u0[i], 0); // multiply constant q2_K part with sum of q8_1 values
+        sumf_m1 += d8[i] * ggml_cuda_dp4a(m, u1[i], 0);
+    }
+
+    const float2 dm2f = __half22float2(dm2);
+
+    return dm2f.x*(sumf_d0 + sumf_d1) - dm2f.y*(sumf_m0 + sumf_m1);
+}
+
+static __device__ __forceinline__ float vec_dot_q2_K_q8_1_vdr2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    // mmvq path with vdr = 2: iqs is even (0, 2, ..., 14) and the thread covers the two
+    // adjacent 16-element sub-blocks iqs and iqs + 1 (32 elements). They share bq8_offset
+    // and scale_offset (both depend only on iqs/8 and (iqs%8)/4), so the loads and scale
+    // unpack below are done once for the pair.
+    const block_q2_K * bq2_K = (const block_q2_K *) vbq + kbx;
+
+    const int bq8_offset = QR2_K * (iqs / QI8_1);
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+
+    const uint8_t * scales = bq2_K->scales + scale_offset;
+
+    const int iqs1 = iqs + 1;
+
+    const int v0 = get_int_b4(bq2_K->qs, iqs);
+    const int v1 = get_int_b4(bq2_K->qs, iqs1);
+
+    int    u0[QR2_K];
+    int    u1[QR2_K];
+    float d8[QR2_K];
+
+#pragma unroll
+    for (int i = 0; i < QR2_K; ++i) {
+        u0[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        u1[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs1 % QI8_1);
+        d8[i]  = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q2_K_q8_1_impl_mmvq_vdr2(v0, v1, u0, u1, scales, bq2_K->dm, d8);
+}
+
 static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
 
@@ -913,6 +1024,41 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
     }
 
     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+}
+
+static __device__ __forceinline__ float vec_dot_q3_K_q8_1_vdr2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    // mmvq path with vdr = 2: iqs is even (0, 2, ..., 14) and the thread covers the
+    // two adjacent sub-blocks iqs and iqs + 1 (32 elements). They share bq8_offset
+    // and scale_offset, so all loads/scale unpacking below are done once for the pair.
+    const block_q3_K * bq3_K = (const block_q3_K *) vbq + kbx;
+
+    const int bq8_offset = QR3_K * (iqs / (QI3_K/2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1/2);
+
+    const float d = bq3_K->d;
+
+    const int iqs1 = iqs + 1;
+
+    const int vl0 = get_int_b2(bq3_K->qs, iqs);
+    const int vh0 = ~get_int_b2(bq3_K->hmask, iqs % (QI3_K/2)) >> bq8_offset;
+
+    const int vl1 = get_int_b2(bq3_K->qs, iqs1);
+    const int vh1 = ~get_int_b2(bq3_K->hmask, iqs1 % (QI3_K/2)) >> bq8_offset;
+
+    int    u0[QR3_K];
+    int    u1[QR3_K];
+    float d8[QR3_K];
+
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        u0[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+        u1[i]  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs1 % QI8_1);
+        d8[i]  = __low2float(bq8_1[bq8_offset + i].ds);
+    }
+
+    return vec_dot_q3_K_q8_1_impl_mmvq_vdr2(vl0, vh0, vl1, vh1, u0, u1, bq3_K->scales, scale_offset, d, d8);
 }
 
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
@@ -1042,6 +1188,74 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
 }
 
+// vdr = 2 variant: one thread covers two adjacent 8-element sub-blocks (iqs and iqs + 1),
+// i.e. 16 elements. Both sub-blocks share the same y blocks (bq8_offset), the same 2 scale
+// values and the same 2 q8_1 block scales, so the scale and d8 loads happen once.
+// Two accumulators keep the two dp4a/FMA chains independent (better ILP on issue-bound parts).
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq_vdr2(
+    const int & vl0, const int & vh0, const int & vl1, const int & vh1,
+    const int * __restrict__ u0, const int * __restrict__ u1,
+    const int8_t * __restrict__ scales, const float & d, const float * __restrict__ d8) {
+
+    float sumf0 = 0.0f;
+    float sumf1 = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        const int sc = scales[4*i];
+
+        const int vil0 = (vl0 >> (4*i)) & 0x0F0F0F0F;
+        const int vih0 = ((vh0 >> (4*i)) << 4) & 0x30303030;
+        const int vi0  = __vsubss4((vil0 | vih0), 0x20202020);
+
+        const int vil1 = (vl1 >> (4*i)) & 0x0F0F0F0F;
+        const int vih1 = ((vh1 >> (4*i)) << 4) & 0x30303030;
+        const int vi1  = __vsubss4((vil1 | vih1), 0x20202020);
+
+        sumf0 += d8[i] * (ggml_cuda_dp4a(vi0, u0[i], 0) * sc);
+        sumf1 += d8[i] * (ggml_cuda_dp4a(vi1, u1[i], 0) * sc);
+    }
+
+    return d * (sumf0 + sumf1);
+}
+
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_vdr2(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    // mmvq path with vdr = 2: iqs is even (0, 2, ..., 30) and the thread covers the two
+    // adjacent 8-element sub-blocks iqs and iqs + 1 (16 elements). They share bq8_offset,
+    // scale_offset and vh_shift (both depend only on iqs/16 and (iqs%16)/8), so those are
+    // computed once for the pair.
+    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+
+    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+
+    const int iqs1 = iqs + 1;
+
+    const int vl0 = get_int_b2(bq6_K->ql, iqs);
+    const int vh0 = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+
+    const int vl1 = get_int_b2(bq6_K->ql, iqs1);
+    const int vh1 = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs1 % (QI6_K/4)) >> vh_shift;
+
+    const int8_t * scales = bq6_K->scales + scale_offset;
+
+    int    u0[QR6_K];
+    int    u1[QR6_K];
+    float d8[QR6_K];
+
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        u0[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+        u1[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs1 % QI8_1);
+        d8[i]  = __low2float(bq8_1[bq8_offset + 2*i].ds);
+    }
+
+    return vec_dot_q6_K_q8_1_impl_mmvq_vdr2(vl0, vh0, vl1, vh1, u0, u1, scales, bq6_K->d, d8);
+}
+
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
 #define VDR_IQ2_XXS_Q8_1_MMQ  2
 
@@ -1166,6 +1380,63 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     return d * sumi;
 }
 
+// Same as vec_dot_iq2_s_q8_1 but reads the 1024-entry (8 KB, uint64 each stored as two
+// uint32) grid from a shared-memory copy. The per-lane gather into the global table costs
+// ~14 L1 cycles per warp access on sm_60, while the same gather in shared memory costs ~2
+// (bank-conflict limited); the grid lookups dominate the IQ2_S dot, so the mmvq kernel
+// stages the table once per block and routes IQ2_S here (Pascal only). The 16 sign LUT
+// entries follow the grid in shared memory and replace the vcmpne4 sign decode with LDS.
+static __device__ __forceinline__ float vec_dot_iq2_s_q8_1_smem(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint32_t * __restrict__ smem_table) {
+
+    const block_iq2_s * bq2 = (const block_iq2_s *) vbq + kbx;
+    const uint32_t * sign_lut = smem_table + 2*1024;
+
+    const int       qs_packed = get_int_b2(bq2->qs, iqs/2);
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq2->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    const int ls0 = bq2->scales[iqs/2] & 0x0F;
+    const int ls1 = bq2->scales[iqs/2] >> 4;
+
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        // 10-bit grid index: 8-bit qs code plus 2 bits of qh (see ggml-quants iq2_s layout).
+        const uint32_t index = qs[l0/2] | ((qh << (8-l0)) & 0x300);
+
+        const int sb = signs_packed_8[l0/2];
+
+        const int signs0 = sign_lut[sb & 0x0F];
+        const int signs1 = sign_lut[(sb >> 4) & 0x0F];
+
+        const int grid_l = __vsub4(smem_table[2*index] ^ signs0, signs0);
+        const int grid_h = __vsub4(smem_table[2*index + 1] ^ signs1, signs1);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        if (l0 < 4) {
+            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+        } else {
+            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
+            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+        }
+    }
+    const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
+
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+
 #define VDR_IQ3_XXS_Q8_1_MMVQ 2
 #define VDR_IQ3_XXS_Q8_1_MMQ  2
 
@@ -1240,6 +1511,72 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
         sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
         sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
     }
+
+    sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
+
+    const float d = __half2float(bq3->d) * __low2float(bq8_1[iqs/2].ds);
+    return d * sumi;
+}
+
+// 4-bit sign nibble -> per-byte 0xFF mask (byte j set iff bit j set). Used by the
+// smem IQ2_S/IQ3_S dots to replace the ~6 instruction vcmpne4 sign decode with one LDS.
+// Both types decode signs bit-for-bit identically: low nibble of the sign byte selects
+// the first 4 bytes, high nibble the next 4 (see vec_dot_iq2_s_q8_1 / vec_dot_iq3_s_q8_1).
+static constexpr __device__ uint32_t iq2s_iq3s_sign_lut[16] = {
+    0x00000000, 0x000000ff, 0x0000ff00, 0x0000ffff,
+    0x00ff0000, 0x00ff00ff, 0x00ffff00, 0x00ffffff,
+    0xff000000, 0xff0000ff, 0xff00ff00, 0xff00ffff,
+    0xffff0000, 0xffff00ff, 0xffffff00, 0xffffffff,
+};
+
+// Same as vec_dot_iq3_s_q8_1 but reads the 512-entry grid from a shared-memory copy.
+// The per-lane gather into the global table costs ~14 L1 cycles per warp access on
+// sm_60, while the same gather in shared memory costs ~2 (bank-conflict limited);
+// the grid lookups are the dominant cost of the IQ3_S dot, so the mmvq kernel stages
+// the table once per block and routes IQ3_S here. The 16 sign LUT entries follow the
+// grid in shared memory and replace the vcmpne4 sign decode with a single LDS.
+static __device__ __forceinline__ float vec_dot_iq3_s_q8_1_smem(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs,
+    const uint32_t * __restrict__ smem_table) {
+
+    const block_iq3_s * bq3 = (const block_iq3_s *) vbq + kbx;
+    const uint32_t * sign_lut = smem_table + 512;
+
+    const int2      qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t * qs        = (const uint8_t *) &qs_packed;
+
+    const int qh = bq3->qh[iqs/2];
+
+    const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
+    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+
+    // Two accumulators keep the two dp4a chains per iteration independent. The 8 LDS
+    // grid lookups have variable bank-conflict latency on sm_60, so explicit chains let
+    // the compiler overlap them instead of serializing on one accumulator.
+    int sumi0 = 0;
+    int sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(
+            smem_table[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            smem_table[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+
+        const int sb = signs_packed_8[l0/2];
+
+        const int signs0 = sign_lut[sb & 0x0F];
+        const int signs1 = sign_lut[(sb >> 4) & 0x0F];
+
+        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+
+        const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+
+        sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
+        sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+    }
+
+    int sumi = sumi0 + sumi1;
 
     sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
 
