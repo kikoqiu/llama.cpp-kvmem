@@ -101,7 +101,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
     MMVQ_PARAMETERS_GB10,
-    MMVQ_PARAMETERS_PASCAL
+    MMVQ_PARAMETERS_PASCAL,
+    MMVQ_PARAMETERS_VOLTA
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -115,6 +116,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_GCN;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL && __CUDA_ARCH__ < GGML_CUDA_CC_DP4A
     return MMVQ_PARAMETERS_PASCAL;
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA
+    return MMVQ_PARAMETERS_VOLTA;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
     return MMVQ_PARAMETERS_TURING;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
@@ -142,6 +145,10 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
         // (see calc_nwarps/calc_rows_per_block) instead of the generic 4-warp/1-row one.
         return MMVQ_PARAMETERS_PASCAL;
     }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_VOLTA) {
+        // sm_70 (V100): see calc_nwarps/calc_rows_per_block.
+        return MMVQ_PARAMETERS_VOLTA;
+    }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
         return MMVQ_PARAMETERS_TURING;
     }
@@ -149,6 +156,11 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
         return MMVQ_PARAMETERS_GB10;
     }
     return MMVQ_PARAMETERS_GENERIC;
+}
+
+// Archs whose IQ2_S/IQ3_S dots read the grid lookup table from shared memory.
+static constexpr __host__ __device__ bool uses_smem_grid_table(mmvq_parameter_table_id table_id) {
+    return table_id == MMVQ_PARAMETERS_PASCAL || table_id == MMVQ_PARAMETERS_VOLTA;
 }
 
 // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
@@ -458,7 +470,7 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_VOLTA) {
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -647,7 +659,30 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1, bool has_fusion = false) {
+    if (table_id == MMVQ_PARAMETERS_VOLTA) {
+        // sm_70 (V100): native dp4a makes the q8_1 activation loads the scarce resource, so the
+        // i-quants run several rows per block (each row reuses y) while the k-quants keep the
+        // generic 1-row layout: with 2 rows Q4_K measures 48.2 vs 46.8 us and Q5_K 57.4 vs 55.0 us.
+        // The fused gate+up kernel keeps 2 rows: it doubles the accumulators and the x traffic
+        // per row, so 4 rows measure 45.2 us on the plain dot but regress end-to-end decode by 10%.
+        if (ncols_dst == 1 && !small_k) {
+            switch (type) {
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
+                case GGML_TYPE_IQ2_XXS:
+                case GGML_TYPE_IQ2_XS:
+                case GGML_TYPE_IQ2_S:
+                case GGML_TYPE_IQ3_XXS:
+                case GGML_TYPE_IQ3_S:
+                case GGML_TYPE_IQ4_XS:
+                    return has_fusion ? 2 : 4;
+                default:
+                    return 1;
+            }
+        }
+        return small_k ? nwarps : 2;
+    }
     if (table_id == MMVQ_PARAMETERS_PASCAL) {
         switch (ncols_dst) {
             case 1:
@@ -777,7 +812,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = (q3k_vdr2 && (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q2_K)) ? 2 : get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, has_fusion);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda =
@@ -879,12 +914,13 @@ static __global__ void mul_mat_vec_q(
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
     // IQ2_S/IQ3_S: stage the grid lookup table plus the 16-entry sign LUT into shared
-    // memory once per block. On sm_60 the per-lane gather into the global table costs ~14
-    // L1 cycles per warp access, while the same gather in shared memory costs ~2
+    // memory once per block. The per-lane gather into the global table costs ~14 L1
+    // cycles per warp access, while the same gather in shared memory costs ~2
     // (bank-conflict limited); the grid lookups dominate both dots.
-    // Pascal-only: other archs keep the plain global-table dot (get_vec_dot_q_cuda).
+    // Smem-grid archs only (see uses_smem_grid_table), the rest keep the plain
+    // global-table dot (get_vec_dot_q_cuda).
     extern __shared__ uint32_t grid_smem[];
-    if constexpr (type == GGML_TYPE_IQ3_S && table_id == MMVQ_PARAMETERS_PASCAL) {
+    if constexpr (type == GGML_TYPE_IQ3_S && uses_smem_grid_table(table_id)) {
         for (int i = tid; i < 512; i += warp_size*nwarps) {
             grid_smem[i] = iq3s_grid[i];
         }
@@ -893,7 +929,7 @@ static __global__ void mul_mat_vec_q(
         }
         __syncthreads();
     }
-    if constexpr (type == GGML_TYPE_IQ2_S && table_id == MMVQ_PARAMETERS_PASCAL) {
+    if constexpr (type == GGML_TYPE_IQ2_S && uses_smem_grid_table(table_id)) {
         // 1024 uint64 entries -> 2048 uint32; low word first (little-endian), matching the
         // (const int *)(iq2s_grid + idx) read in the global-table dot.
         const uint32_t * iq2s_grid32 = (const uint32_t *) iq2s_grid;
@@ -907,10 +943,10 @@ static __global__ void mul_mat_vec_q(
     }
 
     const auto dot = [&](const void * vx_dot, const block_q8_1 * y_dot, const int kbx_dot, const int kqs_dot) -> float {
-        if constexpr (type == GGML_TYPE_IQ3_S && table_id == MMVQ_PARAMETERS_PASCAL) {
+        if constexpr (type == GGML_TYPE_IQ3_S && uses_smem_grid_table(table_id)) {
             return vec_dot_iq3_s_q8_1_smem(vx_dot, y_dot, kbx_dot, kqs_dot, grid_smem);
         }
-        if constexpr (type == GGML_TYPE_IQ2_S && table_id == MMVQ_PARAMETERS_PASCAL) {
+        if constexpr (type == GGML_TYPE_IQ2_S && uses_smem_grid_table(table_id)) {
             if constexpr (iq2s_nolut) {
                 return vec_dot_iq2_s_q8_1_smem_nolut(vx_dot, y_dot, kbx_dot, kqs_dot, grid_smem);
             }
@@ -1205,9 +1241,10 @@ static __global__ void mul_mat_vec_q_moe(
 template<ggml_type type>
 static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
-        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
+        const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false,
+        const bool has_fusion = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps, has_fusion);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1221,11 +1258,20 @@ static void mul_mat_vec_q_switch_fusion(
         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
-        const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
+        const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens, const int warp_size,
+        const mmvq_parameter_table_id table_id, const int nbytes_shared,
         const uint32_t ids_stride, cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+    // The fused kernel needs a different rows_per_block than the plain one (see calc_rows_per_block),
+    // so the launch grid is built here, where has_fusion is known, instead of by the caller.
+    const std::pair<dim3, dim3> dims = calc_launch_params<type>(
+        c_ncols_dst, nrows_x, nchannels_dst, nsamples_or_ntokens, warp_size, table_id, small_k, halve_iters, has_fusion);
+    const dim3 & block_nums = dims.first;
+    const dim3 & block_dims = dims.second;
+
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
@@ -1302,12 +1348,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     // IQ2_S/IQ3_S stage their grid lookup table plus the 16-entry sign LUT into shared
-    // memory once per block (sm_60 only: the per-lane L1 gather costs ~14 cycles/line vs
-    // ~2 bank-conflict-limited LDS). Other archs keep the plain global-table dot.
+    // memory once per block (the per-lane L1 gather costs ~14 cycles/line vs ~2
+    // bank-conflict-limited LDS). Other archs keep the plain global-table dot.
     // IQ2_S: 1024 uint64 entries (8 KB) + 16 LUT entries; IQ3_S: 512 uint32 + 16 LUT.
     const int nbytes_shared =
-        (type == GGML_TYPE_IQ3_S && table_id == MMVQ_PARAMETERS_PASCAL) ? (512 + 16)*sizeof(uint32_t) :
-        (type == GGML_TYPE_IQ2_S && table_id == MMVQ_PARAMETERS_PASCAL) ? (2*1024 + 16)*sizeof(uint32_t) :
+        (type == GGML_TYPE_IQ3_S && uses_smem_grid_table(table_id)) ? (512 + 16)*sizeof(uint32_t) :
+        (type == GGML_TYPE_IQ2_S && uses_smem_grid_table(table_id)) ? (2*1024 + 16)*sizeof(uint32_t) :
         0;
 
     const bool has_ids = ids != nullptr;
@@ -1403,12 +1449,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
 
                 constexpr bool c_halve_iters = decltype(halve_iters_tag)::value && c_promoted;
 
-                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
-                                                                              nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters);
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, q3k_vdr2, iq2s_nolut>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
-                    stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, nbytes_shared, ids_stride,
+                    stride_sample_x, stride_sample_y, stride_sample_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride,
                     stream);
             };
 
@@ -1422,59 +1466,52 @@ static void mul_mat_vec_q_switch_ncols_dst(
         } break;
         case 2: {
             constexpr int c_ncols_dst = 2;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q3k_vdr2, iq2s_nolut>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, nbytes_shared, ids_stride, stream);
+                 nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride, stream);
         } break;
         case 3: {
             constexpr int c_ncols_dst = 3;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q3k_vdr2, iq2s_nolut>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, nbytes_shared, ids_stride, stream);
+                 nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride, stream);
         } break;
         case 4: {
             constexpr int c_ncols_dst = 4;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q3k_vdr2, iq2s_nolut>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, nbytes_shared, ids_stride, stream);
+                 nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride, stream);
         } break;
         case 5: {
             constexpr int c_ncols_dst = 5;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q3k_vdr2, iq2s_nolut>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, nbytes_shared, ids_stride, stream);
+                 nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride, stream);
         } break;
         case 6: {
             constexpr int c_ncols_dst = 6;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q3k_vdr2, iq2s_nolut>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, nbytes_shared, ids_stride, stream);
+                 nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride, stream);
         } break;
         case 7: {
             constexpr int c_ncols_dst = 7;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q3k_vdr2, iq2s_nolut>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, nbytes_shared, ids_stride, stream);
+                 nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride, stream);
         } break;
         case 8: {
             constexpr int c_ncols_dst = 8;
-            std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id);
             mul_mat_vec_q_switch_fusion<type, c_ncols_dst, false, false, q3k_vdr2, iq2s_nolut>(vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst,
-                 dims.first, dims.second, nbytes_shared, ids_stride, stream);
+                 nrows_x, nchannels_dst, nsamples_dst, warp_size, table_id, nbytes_shared, ids_stride, stream);
         } break;
         default:
             GGML_ABORT("fatal error");
