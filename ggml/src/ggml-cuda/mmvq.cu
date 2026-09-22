@@ -470,6 +470,24 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+    if (table_id == MMVQ_PARAMETERS_VOLTA && ncols_dst >= 2 && ncols_dst <= 4) {
+        // MTP verify batches (1 sampled + up to 3 draft tokens). A k=5120 row is 20 K blocks,
+        // so 2 warps cover it in 8-block iterations while 4 warps step 16 and leave the second
+        // iteration 75% idle. iq3_xxs m=17408 k=5120: 94.6 us at 4 warps -> 85.6 at 2 warps.
+        switch (type) {
+            case GGML_TYPE_IQ1_S:
+            case GGML_TYPE_IQ1_M:
+            case GGML_TYPE_IQ2_XXS:
+            case GGML_TYPE_IQ2_XS:
+            case GGML_TYPE_IQ2_S:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ3_S:
+            case GGML_TYPE_IQ4_XS:
+                return 2;
+            default:
+                break;
+        }
+    }
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_VOLTA) {
         switch (ncols_dst) {
             case 1:
@@ -666,7 +684,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         // generic 1-row layout: with 2 rows Q4_K measures 48.2 vs 46.8 us and Q5_K 57.4 vs 55.0 us.
         // The fused gate+up kernel keeps 2 rows: it doubles the accumulators and the x traffic
         // per row, so 4 rows measure 45.2 us on the plain dot but regress end-to-end decode by 10%.
-        if (ncols_dst == 1 && !small_k) {
+        // ncols_dst 2-4 is the MTP verify batch: the same 4 rows make every row reuse the q8_1
+        // columns of all verify tokens (iq3_xxs m=17408 k=5120: n=3 102.6 -> 94.6 us,
+        // n=4 117.8 -> 110.2 us). The k-quants regress with 4 rows there (q4_K n=4: 125.0 -> 133.9).
+        if (ncols_dst <= 4 && !small_k) {
             switch (type) {
                 case GGML_TYPE_IQ1_S:
                 case GGML_TYPE_IQ1_M:
@@ -676,9 +697,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 case GGML_TYPE_IQ3_XXS:
                 case GGML_TYPE_IQ3_S:
                 case GGML_TYPE_IQ4_XS:
-                    return has_fusion ? 2 : 4;
+                    return (ncols_dst == 1 && has_fusion) ? 2 : 4;
                 default:
-                    return 1;
+                    return ncols_dst == 1 ? 1 : 2;
             }
         }
         return small_k ? nwarps : 2;
