@@ -684,10 +684,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
         // generic 1-row layout: with 2 rows Q4_K measures 48.2 vs 46.8 us and Q5_K 57.4 vs 55.0 us.
         // The fused gate+up kernel keeps 2 rows: it doubles the accumulators and the x traffic
         // per row, so 4 rows measure 45.2 us on the plain dot but regress end-to-end decode by 10%.
-        // ncols_dst 2-4 is the MTP verify batch: the same 4 rows make every row reuse the q8_1
-        // columns of all verify tokens (iq3_xxs m=17408 k=5120: n=3 102.6 -> 94.6 us,
-        // n=4 117.8 -> 110.2 us). The k-quants regress with 4 rows there (q4_K n=4: 125.0 -> 133.9).
-        if (ncols_dst <= 4 && !small_k) {
+        // ncols_dst 2-8 is the MTP verify batch: with 4 rows every row reuses the q8_1 columns
+        // of all verify tokens (iq3_xxs m=17408 k=5120: n=3 102.6 -> 94.6 us, n=4 117.8 -> 110.2).
+        // Two parallel slots push the same batch to n=5-8 (iq3_s n=6: 138.6 -> 124.5 us,
+        // iq2_s n=8: 197.3 -> 168.8 us). The k-quants regress with 4 rows there (q4_K n=4: 125.0 -> 133.9).
+        if (ncols_dst <= 8 && !small_k) {
             switch (type) {
                 case GGML_TYPE_IQ1_S:
                 case GGML_TYPE_IQ1_M:
@@ -696,8 +697,10 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 case GGML_TYPE_IQ2_S:
                 case GGML_TYPE_IQ3_XXS:
                 case GGML_TYPE_IQ3_S:
-                case GGML_TYPE_IQ4_XS:
                     return (ncols_dst == 1 && has_fusion) ? 2 : 4;
+                case GGML_TYPE_IQ4_XS:
+                    // 4 rows regressed at n=1 on the m=4096 k=14336 shape (43.8 -> 45.4 us).
+                    return ncols_dst == 1 ? 1 : 4;
                 default:
                     return ncols_dst == 1 ? 1 : 2;
             }
