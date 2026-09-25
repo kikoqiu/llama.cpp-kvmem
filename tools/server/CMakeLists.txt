@@ -65,3 +65,34 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# llama-kvmem-server: KVMem's own single-slot server, built from the out-of-tree
+# KVMem sources. Standalone only, so the KVMem root project can define its own
+# target with the same name.
+
+if (LLAMA_KVMEM AND LLAMA_STANDALONE)
+    set(TARGET llama-kvmem-server)
+
+    add_executable(${TARGET}
+        ${LLAMA_KVMEM_ROOT}/tools/llama-kvmem-server.cpp
+        ${LLAMA_KVMEM_ROOT}/tools/kvmem-spec.cpp
+        ${LLAMA_KVMEM_ROOT}/tools/kvmem-vision.cpp)
+
+    target_include_directories(${TARGET} PRIVATE
+        ${LLAMA_KVMEM_ROOT}/src/adapter
+        ${LLAMA_KVMEM_ROOT}/tools
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/common
+        ${PROJECT_SOURCE_DIR}/vendor
+        ${PROJECT_SOURCE_DIR}/vendor/cpp-httplib
+        ../mtmd)
+
+    target_link_libraries(${TARGET} PRIVATE
+        llama llama-common kvmem server-context cpp-httplib mtmd ${CMAKE_THREAD_LIBS_INIT})
+
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    if(LLAMA_TOOLS_INSTALL)
+        install(TARGETS ${TARGET} RUNTIME)
+    endif()
+endif()
