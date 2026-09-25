@@ -97,6 +97,11 @@ if (LLAMA_KVMEM)
     target_compile_definitions(llama PRIVATE LLAMA_KVMEM=1)
     if (NOT TARGET kvmem)
         add_subdirectory(${LLAMA_KVMEM_ROOT}/kvmem ${CMAKE_BINARY_DIR}/kvmem-from-llama)
+        if (WIN32 AND BUILD_SHARED_LIBS)
+            # kvmem has no dllexport annotations, so a shared build emits no
+            # import library for llama to link against
+            set_target_properties(kvmem PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+        endif()
     endif()
     target_link_libraries(llama PRIVATE kvmem)
     find_package(CUDAToolkit QUIET)
