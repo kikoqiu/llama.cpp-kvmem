@@ -92,6 +92,15 @@ if (LLAMA_KVMEM AND LLAMA_STANDALONE)
 
     target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+    # the KVMem server mounts <exe dir>/../share/kvmem/ui when --ui-dir is absent
+    if (EXISTS ${PROJECT_SOURCE_DIR}/tools/ui/dist/index.html)
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                ${PROJECT_SOURCE_DIR}/tools/ui/dist
+                $<TARGET_FILE_DIR:${TARGET}>/../share/kvmem/ui
+            COMMENT "Provisioning the chat UI for llama-kvmem-server")
+    endif()
+
     if(LLAMA_TOOLS_INSTALL)
         install(TARGETS ${TARGET} RUNTIME)
     endif()
