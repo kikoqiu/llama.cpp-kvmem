@@ -1590,7 +1590,21 @@ struct args_set_input_kq_mask {
     int64_t n_kv;
     int64_t n_stream;
     int64_t n_tps;
+
+    // KVMem: lift the holes guard of the copy-and-patch shortcut
+    bool allow_holes_shortcut;
+    // KVMem: verification only - never take the copy-and-patch shortcut
+    bool force_full_loop;
 };
+
+// KVMem: true when seq_id has holes in [seq_pos_min, seq_pos_max], i.e. the
+// cache is not fully populated between its first and last position for that seq
+static bool kvmem_seq_has_holes(const llama_kv_cells & cells, llama_seq_id seq_id) {
+    const llama_pos sp_min = cells.seq_pos_min(seq_id);
+    const llama_pos sp_max = cells.seq_pos_max(seq_id);
+
+    return sp_min >= 0 && sp_max >= sp_min && cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
+}
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
@@ -1625,6 +1639,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
 
+        // KVMem: the cells do not change while the mask is filled, so the hole
+        // state is computed once per sequence instead of once per token
+        bool holes_done[LLAMA_MAX_SEQ] = {};
+        bool holes_val [LLAMA_MAX_SEQ] = {};
+
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
 
@@ -1654,13 +1673,20 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             // The copy-and-patch shortcut only records cells near seq_pos_min.
             // KVMem resurrects mid-document holes far below that window; they
             // would keep a stale mask (or never be patched). Skip the shortcut
-            // when [pos_min, pos_max] is not fully populated.
-            const llama_pos sp_min = cells.seq_pos_min(seq_id);
-            const llama_pos sp_max = cells.seq_pos_max(seq_id);
-            const bool holes = sp_min >= 0 && sp_max >= sp_min &&
-                cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
+            // when [pos_min, pos_max] is not fully populated, unless
+            // KVMEM_MASK_SHORTCUT lifts the guard. Alibi always keeps the full
+            // loop; M-RoPE positions keep upstream behavior.
+            if (!holes_done[seq_id]) {
+                holes_val[seq_id] = kvmem_seq_has_holes(cells, seq_id);
+                holes_done[seq_id] = true;
+            }
 
-            if (!alibi && !holes) {
+            const bool holes = holes_val[seq_id];
+
+            const bool shortcut = !alibi && !args.force_full_loop &&
+                (!holes || args.allow_holes_shortcut);
+
+            if (shortcut) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
 
@@ -1705,7 +1731,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 if (!alibi) {
                     if (!prev) {
                         // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
+                        // note: when the shortcut is off, `idxs` is never read back
+                        if (shortcut && p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
                             idxs.push_back(j);
                         }
                     }
@@ -1811,6 +1838,134 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// Temporary KVMem attribution: CPU cost of the host-side kq mask fill. Off
+// unless KVMEM_MASK_PERF is set.
+static bool kvmem_mask_perf_on() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("KVMEM_MASK_PERF");
+        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// Temporary KVMem switch: allow the copy-and-patch shortcut for sequences with
+// holes. Off unless KVMEM_MASK_SHORTCUT=1, see KVMEM_MASK_VERIFY.
+static bool kvmem_mask_shortcut_on() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("KVMEM_MASK_SHORTCUT");
+        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// Temporary KVMem verification: fill the mask with the guarded logic, then with
+// the forced shortcut and compare both byte by byte. Doubles the fill cost, so
+// use it on short prompts only.
+static bool kvmem_mask_verify_on() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("KVMEM_MASK_VERIFY");
+        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// Temporary KVMem verification: also run the guarded pass as a full loop, so
+// that ubatches without holes are covered by the comparison as well.
+static bool kvmem_mask_verify_force_holes_on() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("KVMEM_MASK_VERIFY_FORCE_HOLES");
+        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// Temporary KVMem verification: check that lifting the holes guard does not
+// change the mask, before enabling it with KVMEM_MASK_SHORTCUT.
+template<typename T>
+static void kvmem_verify_kq_mask(const args_set_input_kq_mask & args, ggml_tensor * dst, bool causal_attn) {
+    static thread_local std::vector<uint8_t> ref;
+
+    const size_t nbytes = ggml_nbytes(dst);
+
+    ref.resize(nbytes);
+
+    T * data = (T *) dst->data;
+    T * refd = (T *) ref.data();
+
+    if (kvmem_mask_verify_force_holes_on()) {
+        args_set_input_kq_mask args_full = args;
+        args_full.allow_holes_shortcut = false;
+        args_full.force_full_loop      = true;
+
+        set_input_kq_mask_impl<T>(args_full, data, causal_attn);
+    }
+
+    args_set_input_kq_mask args_short = args;
+    args_short.allow_holes_shortcut = true;
+    args_short.force_full_loop      = false;
+
+    set_input_kq_mask_impl<T>(args_short, refd, causal_attn);
+
+    const int64_t n_kv     = args.n_kv;
+    const int64_t n_tokens = args.ubatch->n_tokens;
+
+    int64_t n_mismatch = 0;
+
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const size_t k = i*n_kv + j;
+
+            if (memcmp(data + k, refd + k, sizeof(T)) == 0) {
+                continue;
+            }
+
+            if (n_mismatch < 8) {
+                fprintf(stderr, "KVMEM_MASK_VERIFY MISMATCH i=%lld j=%lld dst=%g ref=%g\n",
+                        (long long) i, (long long) j,
+                        (double) llama_cast<float>(data[k]), (double) llama_cast<float>(refd[k]));
+            }
+
+            ++n_mismatch;
+        }
+    }
+
+    // report how many of the sequences in the batch have holes
+    bool seen[LLAMA_MAX_SEQ] = {};
+
+    int n_holes_seq = 0;
+
+    for (uint32_t i = 0; i < args.ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = args.ubatch->seq_id[i][0];
+
+        if (seen[seq_id]) {
+            continue;
+        }
+
+        seen[seq_id] = true;
+
+        if (kvmem_seq_has_holes(args.v_cells.at(args.seq_to_stream[seq_id]), seq_id)) {
+            ++n_holes_seq;
+        }
+    }
+
+    static uint64_t n_calls      = 0;
+    static uint64_t n_bad_calls  = 0;
+    static uint64_t n_mismatches = 0;
+
+    ++n_calls;
+    n_bad_calls  += n_mismatch > 0 ? 1 : 0;
+    n_mismatches += (uint64_t) n_mismatch;
+
+    fprintf(stderr, "KVMEM_MASK_VERIFY call=%llu n_tokens=%u n_kv=%lld n_stream=%lld holes_seq=%d mismatch=%lld bad_calls=%llu total_mismatch=%llu\n",
+            (unsigned long long) n_calls, args.ubatch->n_tokens, (long long) n_kv,
+            (long long) args.n_stream, n_holes_seq, (long long) n_mismatch,
+            (unsigned long long) n_bad_calls, (unsigned long long) n_mismatches);
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
@@ -1842,12 +1997,34 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_kv             =*/ n_kv,
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
+        /*.allow_holes_shortcut =*/ kvmem_mask_shortcut_on(),
+        /*.force_full_loop  =*/ false,
     };
+
+    const bool mask_perf = kvmem_mask_perf_on();
+    const int64_t t_mask = mask_perf ? ggml_time_us() : 0;
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    if (mask_perf) {
+        fprintf(stderr, "KVMEM_MASK n_tokens=%u n_kv=%lld n_stream=%lld causal=%d us=%lld\n",
+                n_tokens, (long long) n_kv, (long long) n_stream, (int) causal_attn,
+                (long long) (ggml_time_us() - t_mask));
+    }
+
+    // Temporary KVMem verification: the shortcut path must produce the same mask
+    // as the guarded one. Runs after the timing above, so that the reported
+    // KVMEM_MASK timings are not polluted by the extra pass.
+    if (kvmem_mask_verify_on()) {
+        if (dst->type == GGML_TYPE_F16) {
+            kvmem_verify_kq_mask<ggml_fp16_t>(args, dst, causal_attn);
+        } else {
+            kvmem_verify_kq_mask<float>(args, dst, causal_attn);
+        }
     }
 
     //const int64_t t_end = ggml_time_us();
