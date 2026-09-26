@@ -1507,8 +1507,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         static uint32_t kvmem_n_ubatch = 0;
         static int64_t kvmem_t_prev = 0;
         const int64_t kvmem_t3 = ggml_time_us();
-        fprintf(stderr, "KVMEM_STAGE ubatch=%u n=%u set_input_us=%lld graph_submit_us=%lld harvest_us=%lld wall_us=%lld\n",
-                ++kvmem_n_ubatch, ubatch.n_tokens,
+        fprintf(stderr, "KVMEM_STAGE ubatch=%u n=%u sched=%p is_mtp=%d "
+                "set_input_us=%lld graph_submit_us=%lld harvest_us=%lld wall_us=%lld\n",
+                ++kvmem_n_ubatch, ubatch.n_tokens, (const void *) sched.get(),
+                (int) (gtype == LLM_GRAPH_TYPE_DECODER_MTP),
                 (long long) kvmem_t_set_input, (long long) kvmem_t_graph,
                 (long long) (kvmem_t3 - kvmem_t2),
                 (long long) (kvmem_t_prev ? kvmem_t3 - kvmem_t_prev : 0));
