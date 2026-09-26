@@ -131,7 +131,8 @@ option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE
 # KVMem out-of-tree adapter (kvmem_llamacpp). Off by default so a vanilla
 # submodule build stays bit-identical to upstream.
 option(LLAMA_KVMEM "llama: compile KVMem memory adapter" OFF)
-set(LLAMA_KVMEM_ROOT "" CACHE PATH "kvmem_llamacpp root (libkvmem + src/adapter)")
+set(LLAMA_KVMEM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/kvmem-llama.cpp" CACHE PATH
+    "kvmem_llamacpp root (libkvmem + src/adapter); the kvmem-llama.cpp submodule")
 
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})

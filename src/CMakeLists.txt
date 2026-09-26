@@ -71,8 +71,9 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 target_link_libraries(llama PUBLIC ggml)
 
 if (LLAMA_KVMEM)
-    if (LLAMA_KVMEM_ROOT STREQUAL "")
-        message(FATAL_ERROR "LLAMA_KVMEM=ON requires LLAMA_KVMEM_ROOT")
+    if (NOT EXISTS "${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp")
+        message(FATAL_ERROR
+            "LLAMA_KVMEM=ON needs the kvmem sources: run 'git submodule update --init kvmem-llama.cpp' or set LLAMA_KVMEM_ROOT (current: '${LLAMA_KVMEM_ROOT}')")
     endif()
     target_sources(llama PRIVATE
         ${LLAMA_KVMEM_ROOT}/src/adapter/llama-memory-kvmem.cpp
