@@ -1671,11 +1671,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
             auto & idxs = seq_idxs[seq_id];
 
             // The copy-and-patch shortcut only records cells near seq_pos_min.
-            // KVMem resurrects mid-document holes far below that window; they
-            // would keep a stale mask (or never be patched). Skip the shortcut
-            // when [pos_min, pos_max] is not fully populated, unless
-            // KVMEM_MASK_SHORTCUT lifts the guard. Alibi always keeps the full
-            // loop; M-RoPE positions keep upstream behavior.
+            // KVMem resurrects mid-document holes far below that window, so the
+            // guard used to force the full loop for them. The shortcut is now
+            // used by default (KVMEM_MASK_SHORTCUT=0 restores the full loop) and
+            // its elements are checked by KVMEM_MASK_VERIFY. Alibi always keeps
+            // the full loop.
             if (!holes_done[seq_id]) {
                 holes_val[seq_id] = kvmem_seq_has_holes(cells, seq_id);
                 holes_done[seq_id] = true;
@@ -1849,13 +1849,14 @@ static bool kvmem_mask_perf_on() {
     return v == 1;
 }
 
-// Temporary KVMem switch: allow the copy-and-patch shortcut for sequences with
-// holes. Off unless KVMEM_MASK_SHORTCUT=1, see KVMEM_MASK_VERIFY.
+// KVMem: the copy-and-patch shortcut applies to sequences with holes as well.
+// Set KVMEM_MASK_SHORTCUT=0 to fall back to the full loop. The elements of the
+// two paths are compared by KVMEM_MASK_VERIFY.
 static bool kvmem_mask_shortcut_on() {
     static int v = -1;
     if (v < 0) {
         const char * e = getenv("KVMEM_MASK_SHORTCUT");
-        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+        v = (e && e[0] == '0') ? 0 : 1;
     }
     return v == 1;
 }
@@ -1883,8 +1884,8 @@ static bool kvmem_mask_verify_force_holes_on() {
     return v == 1;
 }
 
-// Temporary KVMem verification: check that lifting the holes guard does not
-// change the mask, before enabling it with KVMEM_MASK_SHORTCUT.
+// Temporary KVMem verification: check that the shortcut matches the guarded
+// full loop, element by element. See KVMEM_MASK_VERIFY.
 template<typename T>
 static void kvmem_verify_kq_mask(const args_set_input_kq_mask & args, ggml_tensor * dst, bool causal_attn) {
     static thread_local std::vector<uint8_t> ref;
