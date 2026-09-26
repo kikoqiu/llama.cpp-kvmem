@@ -162,6 +162,7 @@ KVMEM_TRACE gen_exceed policy=retrieval rows=3456..3457 resident=1152 mandatory=
 | `KVMEM_LAYOUT_PRUNE` | 1 | layout 只 stage 会被别的块覆盖的源, 其余直接 D2D; 0 = 全量 gather (旧行为) |
 | `KVMEM_LAYOUT_BOUNDED` | 1 | 大 scratch 分配失败时用 1 块 spare 轮转环/链; 0 = 回落 host roundtrip |
 | `KVMEM_LAYOUT_SCRATCH_KB` | 0 | 强制 layout scratch 上限 (KiB); 0 = 按需要多少分配多少 |
+| `KVMEM_Q_WINDOW` | 1 | Stage 5: harvest 只 stage 检索打分要读的 Q 行窗口 (query / prefill span); 0 = 全量拷 Q (旧行为) |
 
 诊断行 (`KVMEM_TRACE=1`): `KVMEM_TRACE layout_scratch moves=.. staged=.. blocks=.. stride=..`,
 `KVMEM stagein layout path=batched|bounded moves=.. staged=.. blocks=..`,
@@ -293,5 +294,17 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    (`-c 262144 --kvmem-budget 50000 --kvmem-gen-reserve 20480 --api-key ...`, CUDA1 + mmproj + MTP)
    上"你好" -> 200。脚本 `temp/_chat_hello.ps1`。`--kvmem-gen-exceed error` 行为不变
    (`default_max_tokens=128` 等于 reserve, 无换池行, 请求夹到 128)。
+9. Stage 5 Q capture 窗口 (2026-09-27, 子模块提交 `30c4183`): harvest staging slot 原来按
+   `K + Q` 定尺寸 (24k / `-ub 1024` 实测 226 MiB, K-only ubatch 是 64 MiB), 现在 `d2h_submit`
+   只拷 `query_contains` / `prefill_query_contains` 接受的行窗口 (第一次到最后一次命中的行),
+   `row0` 放在 `CaptureD2hPipe::Item`, `harvest_from_host` 从 `cur_pos_[row0 + i]` 开始归约。
+   窗口是 commit 会接受的行集的超集, 归约的行顺序不变, 所以结果应逐位一致。窗口在 submit 时选、
+   在 commit 时归约, 因此 `set_prefill_query_spans` 也补了 `harvest_flush()` (另外两个 span
+   setter 本来就有)。`KVMEM_Q_WINDOW=0` 回到全量 staging 做 A/B; `KVMEM_TRACE harvest` 多一个
+   `q_rows=`, `KVMEM_HARVEST_SUM` 有 `q_rows=` 合计。若实测 `q_rows` 接近 ubatch 大小
+   (一个 ubatch 跨过很多 user span), 下一轮才考虑按 run 分别 staging 或设备侧归约。
+   编译通过 (`llama-kvmem-server`), `kvmem_store_test` / `kvmem_runtime_test` OK; T0/T0s/T1/T2/T5
+   门禁未跑, 需要按 `kvmem-llama.cpp/docs/prefill-harvest-optimization.md` 的 Stage 5 表在
+   5050 / 5090 上执行。父仓库 pin 已同步 (做法见 §7.2)。
 
 
