@@ -1397,6 +1397,19 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+#if defined(LLAMA_KVMEM)
+// Temporary KVMem prefill attribution: per-ubatch wall split into set_input,
+// graph submit and harvest. Off unless KVMEM_STAGE_PERF is set.
+static bool kvmem_stage_perf_on() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("KVMEM_STAGE_PERF");
+        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+#endif
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1458,6 +1471,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    const bool kvmem_stage_perf = kvmem_stage_perf_on();
+    int64_t kvmem_t_set_input = 0;
+    int64_t kvmem_t_graph = 0;
+    const int64_t kvmem_t0 = kvmem_stage_perf ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1467,8 +1485,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (kvmem_stage_perf) {
+        kvmem_t_set_input = ggml_time_us() - kvmem_t0;
+    }
 
+    const int64_t kvmem_t1 = kvmem_stage_perf ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (kvmem_stage_perf) {
+        kvmem_t_graph = ggml_time_us() - kvmem_t1;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1476,7 +1501,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
 #if defined(LLAMA_KVMEM)
+    const int64_t kvmem_t2 = kvmem_stage_perf ? ggml_time_us() : 0;
     llama_kvmem_harvest_ubatch(sched.get(), gtype == LLM_GRAPH_TYPE_DECODER_MTP);
+    if (kvmem_stage_perf) {
+        static uint32_t kvmem_n_ubatch = 0;
+        static int64_t kvmem_t_prev = 0;
+        const int64_t kvmem_t3 = ggml_time_us();
+        fprintf(stderr, "KVMEM_STAGE ubatch=%u n=%u set_input_us=%lld graph_submit_us=%lld harvest_us=%lld wall_us=%lld\n",
+                ++kvmem_n_ubatch, ubatch.n_tokens,
+                (long long) kvmem_t_set_input, (long long) kvmem_t_graph,
+                (long long) (kvmem_t3 - kvmem_t2),
+                (long long) (kvmem_t_prev ? kvmem_t3 - kvmem_t_prev : 0));
+        kvmem_t_prev = kvmem_t3;
+    }
 #endif
 
     ret = GGML_STATUS_SUCCESS;
