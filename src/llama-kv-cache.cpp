@@ -1606,6 +1606,32 @@ static bool kvmem_seq_has_holes(const llama_kv_cells & cells, llama_seq_id seq_i
     return sp_min >= 0 && sp_max >= sp_min && cells.get_used() < (uint32_t) (sp_max - sp_min + 1);
 }
 
+// KVMem: number of distinct sequences in the batch that have holes
+static int kvmem_count_holes_seq(
+        const std::vector<llama_kv_cells> & v_cells,
+        const std::vector<uint32_t>       & seq_to_stream,
+        const llama_ubatch                * ubatch) {
+    bool seen[LLAMA_MAX_SEQ] = {};
+
+    int n = 0;
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+        if (seen[seq_id]) {
+            continue;
+        }
+
+        seen[seq_id] = true;
+
+        if (kvmem_seq_has_holes(v_cells.at(seq_to_stream[seq_id]), seq_id)) {
+            ++n;
+        }
+    }
+
+    return n;
+}
+
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data) {
   //const auto & hparams = args.hparams;
@@ -1935,23 +1961,7 @@ static void kvmem_verify_kq_mask(const args_set_input_kq_mask & args, ggml_tenso
     }
 
     // report how many of the sequences in the batch have holes
-    bool seen[LLAMA_MAX_SEQ] = {};
-
-    int n_holes_seq = 0;
-
-    for (uint32_t i = 0; i < args.ubatch->n_tokens; ++i) {
-        const llama_seq_id seq_id = args.ubatch->seq_id[i][0];
-
-        if (seen[seq_id]) {
-            continue;
-        }
-
-        seen[seq_id] = true;
-
-        if (kvmem_seq_has_holes(args.v_cells.at(args.seq_to_stream[seq_id]), seq_id)) {
-            ++n_holes_seq;
-        }
-    }
+    const int n_holes_seq = kvmem_count_holes_seq(args.v_cells, args.seq_to_stream, args.ubatch);
 
     static uint64_t n_calls      = 0;
     static uint64_t n_bad_calls  = 0;
@@ -2012,8 +2022,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     }
 
     if (mask_perf) {
-        fprintf(stderr, "KVMEM_MASK n_tokens=%u n_kv=%lld n_stream=%lld causal=%d us=%lld\n",
+        // holes_seq and shortcut tell which of the two fill paths is in use
+        fprintf(stderr, "KVMEM_MASK n_tokens=%u n_kv=%lld n_stream=%lld causal=%d holes_seq=%d shortcut=%d us=%lld\n",
                 n_tokens, (long long) n_kv, (long long) n_stream, (int) causal_attn,
+                kvmem_count_holes_seq(v_cells, seq_to_stream, ubatch), (int) args.allow_holes_shortcut,
                 (long long) (ggml_time_us() - t_mask));
     }
 
