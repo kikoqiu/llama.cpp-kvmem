@@ -153,6 +153,21 @@ KVMEM_TRACE gen_exceed policy=retrieval rows=3456..3457 resident=1152 mandatory=
 `resident` / `mandatory` / `free_slots` 是换出前的状态; `rows=a..b` 是本次 ubatch 占的行区间。
 换池后返回 `budget` 内的窗口, `gen_reserve` 区空出来。
 
+临时显存策略 (默认全开; 置 0 / 0MB 可回到旧的"一次分配"行为做 A/B):
+
+| 开关 | 默认 | 作用 |
+|---|---|---|
+| `KVMEM_TEMP_BUDGET_MB` | 512 | 池上限 (`cap_blocks`) 里预留多少卡上显存给 harvest staging / layout scratch; 0 = 不预留 |
+| `KVMEM_STAGING_TRIM` | 1 | 显存紧张时归还空闲的 D2H staging slot (layout 前, 以及"兄弟 slot 比本次需要更大"时); 0 = 一直缓存 |
+| `KVMEM_LAYOUT_PRUNE` | 1 | layout 只 stage 会被别的块覆盖的源, 其余直接 D2D; 0 = 全量 gather (旧行为) |
+| `KVMEM_LAYOUT_BOUNDED` | 1 | 大 scratch 分配失败时用 1 块 spare 轮转环/链; 0 = 回落 host roundtrip |
+| `KVMEM_LAYOUT_SCRATCH_KB` | 0 | 强制 layout scratch 上限 (KiB); 0 = 按需要多少分配多少 |
+
+诊断行 (`KVMEM_TRACE=1`): `KVMEM_TRACE layout_scratch moves=.. staged=.. blocks=.. stride=..`,
+`KVMEM stagein layout path=batched|bounded moves=.. staged=.. blocks=..`,
+`KVMEM_STAGING_TRIM slot=.. freed_bytes=.. reason=layout|grow_retry`,
+`KVMEM_CAPTURE_MEMORY` (两个 staging slot 的实际容量 + pinned 总量)。
+
 ## 5. 单测
 
 ```bat
@@ -229,13 +244,22 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    (要独立构建需自己恢复那个嵌套子模块)。
 4. `temp/` 目录仍是 scratch, 不参与版本管理 (`temp/kvmem-merge-notes.md` 是旧记录,
    新的权威说明就是本文档; 冒烟脚本 `temp/_pq_smoke.ps1` 可复跑)。
-5. 验证状态 (2026-09-26): `kvmem_store_test` / `kvmem_runtime_test` = OK;
+5. 临时显存优化 A/B (2026-09-27, 未提交; 脚本 `temp/_tmpbuf_ab.ps1`, 日志 `temp/_tmpb_*.log`):
+   24k prompt + budget 20480 (触发 retrieval) + 27B IQ3 + `-ctk q8_0 -ctv q4_0` + ub 1024 上,
+   默认组 / 四个开关全关组 / 强制 1 块 spare 组 / 强制 trim 组 的 `content_sha` 完全相同;
+   staging 峰值 226 MiB + 64 MiB; layout scratch: 旧 60 块 -> 新 29 块 (stride 208 KiB),
+   强制组 1 块且 `path=bounded` (layout 117 ms vs batched 113 ms), trim 组在 layout 前归还 290 MiB;
+   `cap_blocks` 2498 -> 2341 (512 MiB 预留, 本配置池由 budget 决定所以池大小不变)。
+   实现细节 + P2' (Q capture 归约, 本轮未做) 计划: `kvmem-llama.cpp/docs/retrieval-stagein-optimization.md`
+   末尾的 "2026-09-27 - Temp VRAM bounds" 与 `prefill-harvest-optimization.md` 的 "Stage 5"。
+   子模块提交 `df58ac9` (本地, 未 push), 父仓库 pin 已同步 (见 §7.1/§7.2 的 cacheinfo 做法)。
+6. 验证状态 (2026-09-26): `kvmem_store_test` / `kvmem_runtime_test` = OK;
    27B IQ3 (V100 16 GiB, 小池 `--kvmem-budget 1024 --kvmem-gen-reserve 512`) 冒烟通过,
    默认 `prefill=retrieval`, 压力行形如 `policy=retrieval q_rows=13 spans=2`,
    回答正确。真实漂移收敛量需要在 27B + mmproj 的大池配置 (如
    `--kvmem-budget 60000 --kvmem-gen-reserve 20480 -c 262144`) 上按同一对话
    "KV 保留 vs KV 丢弃重 prefill" 对比。
-6. gen_reserve 超限验证 (2026-09-26, 脚本 `temp/_gen_exceed_smoke.ps1`, 27B IQ3 V100):
+7. gen_reserve 超限验证 (2026-09-26, 脚本 `temp/_gen_exceed_smoke.ps1`, 27B IQ3 V100):
    - `--kvmem-gen-exceed retrieval` + `--kvmem-gen-reserve 128` + `max_tokens 300`:
      `KVMEM_STARTUP ready` 里 `generation_limit=16384` (等于 `-c`), `default_max_tokens=128`;
      日志出现 `KVMEM_TRACE gen_exceed policy=retrieval rows=3456..3457 resident=1152
@@ -254,7 +278,7 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
        out:   history=[3 4]          gen=[]
      ```
      即本轮生成块与历史块同场评分, 这两次落选的都是历史块 (sink block 0 按 sink 策略始终保留)。
-7. 回归修复 (2026-09-26): 上一版把 retrieval 模式的 `generation_limit` 提到 `-c` 之后, 请求不带
+8. 回归修复 (2026-09-26): 上一版把 retrieval 模式的 `generation_limit` 提到 `-c` 之后, 请求不带
    `max_tokens` 时 `kvmem_output_limit()` 仍用 *上限* 兜底, 于是 `cr.max_tokens = n_ctx`,
    被 `toks.size() + cr.max_tokens > llama_n_ctx()` (`llama-kvmem-server.cpp:2315`) 挡成
    400 `prompt + max_tokens exceeds n_ctx` - 一条 "你好" 就会触发。两处改动:
