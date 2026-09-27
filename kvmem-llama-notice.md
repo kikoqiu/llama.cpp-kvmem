@@ -2,8 +2,9 @@
 
 本文档说明 `llama.cpp-kvmem` 与 `kvmem-llama.cpp` 两个仓库现在的关系, 为什么把引用方向反转,
 以及 llama.cpp 侧 KVMem patch 的来源与合并历史。构建命令和运行参数在最后。
+`kvmem-llama.cpp` 是独立的外部项目, 两个仓库各有自己的上游, 见 1.1 节 (最容易搞错的地方)。
 
-日期: 2026-09-26. 当前分支: 本仓库 `kvmem`。
+日期: 2026-09-26; 1.1 节、5 节、7.2 末尾与 7.11-7.14 在 2026-09-28 补过。当前分支: 本仓库 `kvmem`。
 
 ## 1. 现在的结构
 
@@ -13,7 +14,7 @@ llama.cpp-kvmem/            本仓库 = 打过 KVMem patch 的 llama.cpp (分支
   tools/server/CMakeLists.txt   llama-kvmem-server target (源码引用子模块)
   src/CMakeLists.txt            llama target 追加 adapter 源文件
   CMakeLists.txt                LLAMA_KVMEM / LLAMA_KVMEM_ROOT
-  kvmem-llama.cpp/          子模块 = KVMem 上游仓库 (host 策略 + adapter + server/CLI 源码)
+  kvmem-llama.cpp/          子模块 = 外部项目 kvmem-llama.cpp 本体 (host 策略 + adapter + server/CLI 源码)
 ```
 
 两个仓库各自编一部分, 最后链接成一个可执行文件:
@@ -24,11 +25,31 @@ llama.cpp-kvmem/            本仓库 = 打过 KVMem patch 的 llama.cpp (分支
 | `llama-common.dll` | 本仓库 `common/` | 含 patch 改过的 `speculative.cpp` / `reasoning-budget.cpp` 等 |
 | `mtmd.dll`, `server-context.lib` | 本仓库 `tools/mtmd/`, `tools/server/` | `server-common.cpp` 只编一份 |
 | `kvmem.dll` | 子模块 `kvmem/src/host/*.cpp` | 纯 host 策略: block 表, 选择, tier, raw-K, runtime |
-| `llama-kvmem-server.exe` | 子模块 `tools/llama-kvmem-server.cpp`, `kvmem-spec.cpp`, `kvmem-vision.cpp` | 参数解析, chat/vision 流程, prefill/retrieval 编排 |
+| `llama-kvmem-server.exe` | 子模块 `tools/llama-kvmem-server.cpp`, `kvmem-spec.cpp`, `kvmem-vision.cpp`, `kvmem-responses.cpp`, `kvmem-responses-stream.cpp` | 参数解析, chat/vision/responses 流程, prefill/retrieval 编排 |
 | `kvmem_store_test` 等 | 子模块 `kvmem/tests/` | 无 GPU 单测 |
 
 关键点: 改子模块里的文件, 本仓库的构建会直接编进去 (不存在第二份拷贝);
 改 llama.cpp patch (例如 `src/llama-graph.cpp`) 只需要改本仓库一处。
+
+## 1.1 两个上游, 别搞混 (2026-09-28)
+
+**"同步上游" 说的是哪个上游, 取决于说的是哪个仓库**。两个仓库各有自己的 `origin`,
+合并要在两个不同的地方做, 不要互串:
+
+| 说的是 | 上游 `origin` | 在哪做 merge | 命令 |
+| --- | --- | --- | --- |
+| llama.cpp 上游 | 本仓库的 `origin` = `https://github.com/ggerganov/llama.cpp.git` | 本仓库, 分支 `kvmem` | `git fetch origin` + `git merge origin/master` |
+| kVMem 上游 | 子模块自己的 `origin` = `https://github.com/kvmem/kvmem-llama.cpp.git` | 子模块目录 `kvmem-llama.cpp/`, 它自己的分支 `master` | `git -C kvmem-llama.cpp fetch origin` + 在子模块里 merge |
+
+- `kvmem-llama.cpp` 是**独立存在的外部项目**。本仓库只是调整了它的结构 (删掉里面嵌套的
+  `llama.cpp` 子模块, 引用方向反转, 见第 2 节) 并把它当子模块用; 它自己仍要跟自己的上游同步。
+  改了结构不等于"上游变成 llama.cpp", 也不等于不用同步。
+- 在本仓库里 "fetch 上游 + merge" 只会拿到 llama.cpp 的提交, 同步不到 kVMem 的代码;
+  在子模块里 merge 也不会动本仓库的 patch。两件事要分别做。
+- 顺序 (不能反, 因为子模块合并会移动它的 HEAD, 父仓库 pin 要在移动之后重新记一次):
+  1. 在子模块 `kvmem-llama.cpp/` 里合并它的上游 (它的 pin 现状见 7.2 末尾);
+  2. 回到本仓库, 按 7.2 的 cacheinfo 做法把新的子模块提交记进父仓库 pin;
+  3. 最后才是本仓库合 llama.cpp 上游 (历史见第 6 节), 然后编译、运行、提交。
 
 ## 2. 引用反转 (2026-09-26)
 
@@ -173,15 +194,23 @@ KVMEM_TRACE gen_exceed policy=retrieval rows=3456..3457 resident=1152 mandatory=
 
 ```bat
 cd E:\build\llama.cpp-kvmem\build
-cmake --build . --config Release --target kvmem_store_test kvmem_runtime_test -j 5
+cmake --build . --config Release --target kvmem_store_test pinned_kv_tier_test -j 5
 build\bin\Release\kvmem_store_test.exe     :: 期望 OK
-build\bin\Release\kvmem_runtime_test.exe   :: 期望 OK
+build\bin\Release\pinned_kv_tier_test.exe  :: 期望 OK
 ```
 
 `kvmem_store_test` 覆盖 prefill 压力的 recency 旧契约、新的分数选择、`recent_blocks` 后缀钉住、
 mandatory(incoming) 必须留在预算内, 以及压力预算独立于语义预算。
 
+Windows 上只有 `kvmem_store_test` / `pinned_kv_tier_test` 有 target: 子模块 `kvmem/CMakeLists.txt`
+把 `nvme_kv_tier_test` / `kvmem_runtime_test` / `raw_kv_store_test` 归为 POSIX-only (走 unistd.h 与
+/tmp), 在 Windows 上直接跳过。`build/bin/Release/kvmem_runtime_test.exe` 是以前留下的产物,
+不是本仓库现在能编出来的 target。
+
 ## 6. patch / merge 历史 (本仓库 `kvmem` 分支)
+
+下表的 merge 都是把 **llama.cpp 上游** (`origin/master`) 合进本仓库; 子模块 `kvmem-llama.cpp`
+跟自己上游的同步是另一件事, 不在这里记录 (见 1.1 节)。
 
 | 提交 | 内容 |
 | --- | --- |
@@ -227,12 +256,12 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
 
 ## 7. 注意事项与未完成项
 
-1. **子模块 pin 是本地提交**: 子模块 HEAD `68fbc13` (含 `8818ec7` / `487c2e8`) 只存在于这台机器,
+1. **子模块 pin 是本地提交**: 子模块 HEAD `f860546` (2026-09-28; 合并前是 `e152e59`, 更早是 `68fbc13`) 只存在于这台机器,
    未推送到任何 remote。`git clone` 本仓库后 `git submodule update --init kvmem-llama.cpp`
    会去 `https://github.com/kvmem/kvmem-llama.cpp.git` 找这个提交而失败。要分享或换机,
-   需要先把这两个提交推到可访问的 remote (你自己的 fork / 分支), 必要时改 `.gitmodules`
+   需要先把这些本地提交推到可访问的 remote (自己的 fork / 分支), 必要时改 `.gitmodules`
    的 url。**没有 push, 这是有意的。**
-2. 子模块的本地 `master` 现在领先 `origin/master` 三个提交; 并且本轮把它的 `.gitmodules`
+2. 子模块的本地 `master` 领先它自己的 `origin/master` (数字见本项末尾的 "上游现状"); 并且本轮把它的 `.gitmodules`
    改成空文件 (原来记录 `llama.cpp` 子模块)。从上游 `git pull` 会重新带回那个条目,
    建议把这些提交放到自己的分支上维护, 而不是继续直接堆在 `master`。
    **注意**: `kvmem-llama.cpp/.git` 是嵌套的独立仓库 (不是标准的 `.git/modules/...` gitdir),
@@ -241,6 +270,10 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    `git update-index --cacheinfo 160000 <sha> kvmem-llama.cpp` 后再 commit
    (本轮即如此记录 `68fbc13`)。想根治可以跑 `git submodule absorbgitdirs kvmem-llama.cpp`,
    把 `.git` 收进 `.git/modules/`。
+   **上游现状 (2026-09-28 合完)**: 子模块已 fetch 并把自己的 `origin/master` (`95a2155b`) 合进本地
+   `master`, 结果是 merge 提交 `f860546` (合并前状态 `e152e59` 打了 tag `kvmem-sub-premerge-20260928`),
+   父仓库 pin 已按上面的 cacheinfo 做法更新到 `f860546`。上一状态那 8 个本地提交现在是这个 merge 的
+   第一个 parent, 仍在历史里, 但没有 push, 依旧只存在于这台机器上 (见 7.1)。
 3. 子模块不再自带 llama.cpp, 所以 kvmem 仓库不能再用 `KVMEM_BUILD_LLAMA=ON` 独立构建
    (要独立构建需自己恢复那个嵌套子模块)。
 4. `temp/` 目录仍是 scratch, 不参与版本管理 (`temp/kvmem-merge-notes.md` 是旧记录,
@@ -322,5 +355,38 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    编译通过 (`llama-kvmem-server`)。真机待验证: `/props` 里 `default_max_tokens` 在 retrieval 下应等于
    `min(-c, budget + gen_reserve)` (IQ3 配置 -> 53248), `--kvmem-gen-exceed error` 下等于 `gen_reserve`。
    父仓库 pin 已按 §7.2 的 cacheinfo 做法从 `30c4183` 更新到 `e152e59`。
+11. 子模块合上游 (2026-09-28, merge 提交 `f860546`): 6 个冲突文件的处理方式:
+    - `README.md` / `tools/kvmem-server-env.h` / `tools/kvmem-server-options.h`: 取并集 - 上游新增条目
+      与本仓库的 `--kvmem-swap-ui` 等条目都保留 (env 别名表两边都在加), README 去掉重复的
+      `--kvmem-gen-reserve` 表项。
+    - `src/adapter/llama-memory-kvmem.{h,cpp}`: 上游带来多卡 batch D2H 路径 (`MultiD2hPipe` /
+      `multi_d2h_submit`, 整 tensor 拷贝) 与 tensor-split 的 Meta device 枚举 (见 7.12), 本仓库有
+      Q 行窗口 `row0`、bounded layout scratch 与 staging trim。合并后 `d2d_ok` 只在单 GPU tensor
+      路径成立 (`n_res > 0 && !multi_gpu_`, 多卡走 host 回落), scratch 也只在那条路径分配;
+      `harvest_from_host` 保留本仓库的 `row0` 参数, batch 路径整 tensor 拷贝所以 `row0` 保持 0
+      (这个调用点在合并时漏了参数, 编译报 C2660, 已补 `c.row0`)。
+    - `tools/llama-kvmem-server.cpp`: 保留本仓库的 swap-status / gdn checkpoint / diag 代码,
+      接上游的同名函数重构 (中间被合并脚本弄坏过一次, 已手工修)。
+12. 更新后的 patch 重放到本仓库 (2026-09-28, 5 个 llama.cpp 侧文件): 子模块的累计补丁
+    (`patches/llama-kvmem-current.patch`) 改了 llama.cpp 侧, 本仓库要跟着改:
+    - 新增 `ggml/include/ggml-backend.h` + `ggml/src/ggml-backend-meta.cpp`: 把上游的
+      `static ggml_backend_meta_dev_n_devs` / `ggml_backend_meta_dev_simple_dev` 改名成公开的
+      `ggml_backend_meta_device_count` / `ggml_backend_meta_device_get` (adapter 的 Meta device 枚举
+      要调); 顺手修了构造函数里 `simple_devs` 被同名参数遮蔽的问题 (name/description 用 `this->`)。
+    - 新增 `ggml/src/ggml-hip/CMakeLists.txt` 的两个 HIP 7.15 workaround: RDNA4 Q2_K MMQ unroll 上限
+      与 Windows gfx1200 IQ3_XXS partial-register rewrite, 都是 option, 默认 ON, 只按 arch 生效。
+    - `ggml/src/ggml-cuda/gated_delta_net.cu`: `gdn_fold_f32` 改成按 physical warp size (32/64) 取
+      rows + `static_assert`, HIP 侧按设备 warp size 启动 (CUDA 侧仍 32x4)。
+    - `src/CMakeLists.txt`: `find_package(CUDAToolkit)` / `CUDA::cudart` 包进 `if (GGML_CUDA)`。
+    - 本仓库自己还要补 `tools/server/CMakeLists.txt`: 上游把 responses API 拆成新文件,
+      llama-kvmem-server 的源文件表要加 `tools/kvmem-responses.cpp` 与
+      `tools/kvmem-responses-stream.cpp` (不加就是 4 个 `kvmem_responses_*` 的 LNK2019)。
+13. 本轮验证 (2026-09-28): `cmake --build . --config Release --target llama-kvmem-server` 0 error;
+    `kvmem_store_test` / `pinned_kv_tier_test` = OK; 27B IQ3 (V100 16 GiB, `--kvmem-budget 1024
+    --kvmem-gen-reserve 512`, `temp/_pq_smoke.ps1`) 冒烟通过, 回答 `APPLE-11`, trace 仍是
+    `policy=retrieval q_rows=13 spans=2`。
+14. 本仓库 (llama.cpp 侧) 这一轮还没合上游: HEAD `b52ebb728` (tag `kvmem-premerge-20260928`) 落后
+    `origin/master` (`136887b66`, 2026-09-27) 68 个提交, 上次合上游是 `d39e9df12` (2026-09-25)。
+    下一步按 1.1 节的顺序做本仓库的 merge (冲突面见第 6 节), 合完重跑 13 的验证。
 
 

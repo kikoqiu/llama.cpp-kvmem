@@ -321,34 +321,37 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 }
 
 static __global__ void gdn_fold_f32(const ggml_cuda_gdn_replay_layer * layers, int n_keep) {
+    constexpr int width = ggml_cuda_get_physical_warp_size();
+    constexpr int rows = 128 / width;
+    static_assert(width == 32 || width == 64, "unsupported GDN wave size");
     const auto layer = layers[blockIdx.y];
     const int head = blockIdx.x;
     const int lane = threadIdx.x;
     const int col = blockIdx.z * blockDim.y + threadIdx.y;
     float * state = layer.state + (head * 128 + col) * 128;
-    float s[4];
+    float s[rows];
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        s[r] = state[r * 32 + lane];
+    for (int r = 0; r < rows; ++r) {
+        s[r] = state[r * width + lane];
     }
     for (int t = 0; t < n_keep; ++t) {
         const float * key = layer.key + (t * 16 + head % 16) * 128;
-        float k[4];
+        float k[rows];
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            k[r] = key[r * 32 + lane];
+        for (int r = 0; r < rows; ++r) {
+            k[r] = key[r * width + lane];
         }
         const float decay = expf(layer.gate[t * 48 + head]);
-        const float delta = gdn_delta_f32<4, 32>(s, k, decay,
+        const float delta = gdn_delta_f32<rows, width>(s, k, decay,
                 layer.value[(t * 48 + head) * 128 + col], layer.beta[t * 48 + head]);
 #pragma unroll
-        for (int r = 0; r < 4; ++r) {
+        for (int r = 0; r < rows; ++r) {
             s[r] = gdn_update_f32(s[r], k[r], decay, delta);
         }
     }
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        state[r * 32 + lane] = s[r];
+    for (int r = 0; r < rows; ++r) {
+        state[r * width + lane] = s[r];
     }
 }
 
@@ -374,7 +377,13 @@ bool ggml_backend_cuda_gdn_fold(const ggml_cuda_gdn_replay_layer * layers,
     if (n_keep == 0) return true;
     if (!layers || n_layers <= 0 || n_keep < 0 || n_keep > capacity || capacity > 6) return false;
     const auto stream = static_cast<cudaStream_t>(stream_ptr);
+#if defined(GGML_USE_HIP)
+    const int width = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    if (width != 32 && width != 64) return false;
+    gdn_fold_f32<<<dim3(48, n_layers, 32), dim3(width, 4), 0, stream>>>(layers, n_keep);
+#else
     gdn_fold_f32<<<dim3(48, n_layers, 32), dim3(32, 4), 0, stream>>>(layers, n_keep);
+#endif
     if (cudaGetLastError() != cudaSuccess) return false;
     gdn_conv_fold_f32<<<dim3(40, n_layers), 256, 0, stream>>>(layers, n_keep);
     return cudaGetLastError() == cudaSuccess;

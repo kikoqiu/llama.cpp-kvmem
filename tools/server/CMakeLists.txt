@@ -76,7 +76,9 @@ if (LLAMA_KVMEM AND LLAMA_STANDALONE)
     add_executable(${TARGET}
         ${LLAMA_KVMEM_ROOT}/tools/llama-kvmem-server.cpp
         ${LLAMA_KVMEM_ROOT}/tools/kvmem-spec.cpp
-        ${LLAMA_KVMEM_ROOT}/tools/kvmem-vision.cpp)
+        ${LLAMA_KVMEM_ROOT}/tools/kvmem-vision.cpp
+        ${LLAMA_KVMEM_ROOT}/tools/kvmem-responses.cpp
+        ${LLAMA_KVMEM_ROOT}/tools/kvmem-responses-stream.cpp)
 
     target_include_directories(${TARGET} PRIVATE
         ${LLAMA_KVMEM_ROOT}/src/adapter
