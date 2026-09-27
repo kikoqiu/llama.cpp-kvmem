@@ -129,8 +129,8 @@ llama-kvmem-server.exe -m Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf ^
   前缀和 `--kvmem-recent-tokens` 后缀策略与普通 retrieval 完全一致, 只有落选块才先 harvest 再下到
   host store。select 窗口回到 `--kvmem-budget` 内, `gen_reserve` 区重新空出来继续 decode。需要
   `-fa on` (packed V); 关闭 FA 时回落旧的 error 行为。旧行为可用 `--kvmem-gen-exceed error` 保留,
-  该模式下 server 仍把 `max_tokens` 夹到 `gen_reserve`; retrieval 模式下 generation 只受 `-c` 限制,
-  但省略 `max_tokens` 时默认输出仍是 recipe 的 reserve 值。
+  该模式下 server 仍把 `max_tokens` 夹到 `gen_reserve`; retrieval 模式下 generation 只受 `-c` 限制。
+  省略 `max_tokens` 时的默认输出按模式取值: retrieval 是整个池 (`budget + gen_reserve`), error 是 `gen_reserve`。
 
 诊断 (需要 `--kvmem-trace`):
 
@@ -306,5 +306,21 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    编译通过 (`llama-kvmem-server`), `kvmem_store_test` / `kvmem_runtime_test` OK; T0/T0s/T1/T2/T5
    门禁未跑, 需要按 `kvmem-llama.cpp/docs/prefill-harvest-optimization.md` 的 Stage 5 表在
    5050 / 5090 上执行。父仓库 pin 已同步 (做法见 §7.2)。
+10. 默认输出改为整个池 (2026-09-27, 子模块提交 `e152e59`, 本地未 push): 上一版把 retrieval 的 `generation_limit` 提升到
+   `-c`, 但请求省略 `max_tokens` 时默认输出仍回落到 `gen_reserve` (注释原文 "An omitted max_tokens keeps
+   the recipe's reserve as the output default")。现在默认输出按模式取值: `--kvmem-gen-exceed retrieval` =
+   `budget + gen_reserve` (整个池, 再被 `-c` 夹紧), `error` = `gen_reserve`, 未开 KVMem 或
+   `--kvmem-budget 0` (identity) = `-c`; 显式 `-n` / `--n-predict` 优先级不变。
+   两个启动脚本原来显式传 `-n <reserve>` (Windows `scripts/windows/start-server.ps1`,
+   Linux/WSL `scripts/start-server.py`), 会盖住服务端默认值, 现在删除 (IQ3 池 53248 = 36864 + 16384,
+   IQ4 45056 = 32768 + 12288), 让默认值生效。
+   文档同步: README (`Generation length` 段 / `--kvmem-gen-exceed` 表项 / `-n` 段 / recipe 参数块)、
+   `docs/architecture.md`「Generation length vs gen_reserve」、`docs/modification-plan.md`、
+   `docs/recommended-config-performance.md`、`docs/user-feedback-triage.md`、`scripts/windows/README.md`。
+   测试同步: `scripts/windows/test-launcher.ps1` 增加 "`-n` 必须缺席" 断言,
+   `scripts/test_start_server.py` 把 `-n` 归入 "用服务端默认值" 的断言列表。
+   编译通过 (`llama-kvmem-server`)。真机待验证: `/props` 里 `default_max_tokens` 在 retrieval 下应等于
+   `min(-c, budget + gen_reserve)` (IQ3 配置 -> 53248), `--kvmem-gen-exceed error` 下等于 `gen_reserve`。
+   父仓库 pin 已按 §7.2 的 cacheinfo 做法从 `30c4183` 更新到 `e152e59`。
 
 
