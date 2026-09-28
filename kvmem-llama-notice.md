@@ -261,9 +261,9 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    已在 2026-09-28 推送到自己的 fork `https://github.com/kikoqiu/kvmem-llama.cpp` 的 `master`。
    这是 force push: 推送前那个 fork 的 `master` 是上游的 `b8ad6ded` (PR #81/#83 合完的状态),
    那些提交在上游仓库 (`kvmem/kvmem-llama.cpp`) 里仍然存在, 下次合上游会重新进入本地历史。
-   父仓库 `.gitmodules` 的 url 还指向 `https://github.com/kvmem/kvmem-llama.cpp.git`, 那里没有这个提交,
-   所以新克隆后 `git submodule update --init kvmem-llama.cpp` 会失败; 换机时要么把 url 改成 fork,
-   要么用 `-DLLAMA_KVMEM_ROOT=<本地子模块目录>` 指过去。
+   父仓库 `.gitmodules` 的 url 已在 2026-09-28 改成 `https://github.com/kikoqiu/kvmem-llama.cpp.git`,
+   这样新克隆的仓库 `git submodule update --init kvmem-llama.cpp` 才能拿到 pin; 想对着上游源码编译时,
+   用 `-DLLAMA_KVMEM_ROOT=<目录>` 指过去, 或把 url 临时改回 `kvmem/kvmem-llama.cpp`。
 2. 子模块的本地 `master` 领先它自己的 `origin/master` (数字见本项末尾的 "上游现状"); 并且本轮把它的 `.gitmodules`
    改成空文件 (原来记录 `llama.cpp` 子模块)。从上游 `git pull` 会重新带回那个条目,
    建议把这些提交放到自己的分支上维护, 而不是继续直接堆在 `master`。
