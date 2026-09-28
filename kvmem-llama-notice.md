@@ -277,8 +277,14 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    `master`, 结果是 merge 提交 `f860546` (合并前状态 `e152e59` 打了 tag `kvmem-sub-premerge-20260928`),
    父仓库 pin 已按上面的 cacheinfo 做法更新到 `f860546`。上一状态那 8 个本地提交现在是这个 merge 的
    第一个 parent, 仍在历史里; 这些提交已在 2026-09-28 随 fork 一起 push 出去 (见 7.1)。
+   **上游现状 (2026-09-28 第二轮)**: 再 fetch 上游 `kvmem/kvmem-llama.cpp` 的 `master` (`3780506`,
+   tag `v0.17.0`) 并合进本地 `master`, 得到 merge 提交 `aa61c90`。上游这轮带进来的是 v0.17.0 发版说明、
+   PR #81 (session cache 目录回收, 新增 `tools/kvmem-session-cache-dir.h`) 和 PR #83 (server 链接 `kvmem`)。
+   冲突只有 `README.md` 一处 (clone 块): 保留本仓库的独立 `llama.cpp` 克隆写法, 版本号跟上游改成 `v0.17.0`。
 3. 子模块不再自带 llama.cpp, 所以 kvmem 仓库不能再用 `KVMEM_BUILD_LLAMA=ON` 独立构建
-   (要独立构建需自己恢复那个嵌套子模块)。
+   (要独立构建需自己恢复那个嵌套子模块)。**2026-09-28 起更彻底**: 子模块只放源码, 一律由父仓库构建
+   (`LLAMA_KVMEM_ROOT` 直接编 `src/adapter/*.cpp` 与 `tools/llama-kvmem-server.cpp`), 不要再在子模块目录里
+   `cmake -S .` (子模块 `README.md` 已写明)。
 4. `temp/` 目录仍是 scratch, 不参与版本管理 (`temp/kvmem-merge-notes.md` 是旧记录,
    新的权威说明就是本文档; 冒烟脚本也放在 `temp/` 下, 未入库, 可复跑)。
 5. 临时显存优化 A/B (2026-09-27, 未提交; 脚本与日志都在本地 `temp/` 下, 未入库):
