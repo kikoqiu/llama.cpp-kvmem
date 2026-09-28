@@ -17,6 +17,35 @@
 
 </div>
 
+## KVMem fork (V100 16 GiB)
+
+This tree is the experimental KVMem fork of llama.cpp. It carries the llama.cpp side of the KVMem patch and
+builds `llama-kvmem-server` (OpenAI-compatible chat, tools and vision) together with the
+[kvmem-llama.cpp](https://github.com/kikoqiu/kvmem-llama.cpp) submodule.
+
+- Focus: squeeze one **V100 16 GiB** card (sm_70). Performance first: **1000+ t/s prefill** and **60+ t/s decode** at small context.
+- Long context: KVMem keeps a bounded block-slot GPU KV working set and stores the rest in host RAM, so **260k+ context** still fits in 16 GiB.
+- Remotes: this repo (`kvmem` branch) and the submodule (`master` branch) are pushed to `kikoqiu`.
+- Structure, patch/merge history, switches and troubleshooting: [kvmem-llama-notice.md](kvmem-llama-notice.md).
+
+Recommended build (CUDA):
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=native -DGGML_CUDA_FA_ALL_QUANTS=ON -DLLAMA_KVMEM=ON
+cmake --build build --config Release -j
+```
+
+Recommended model: `Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf` (plus `mmproj-Qwen3.8-27B-BF16.gguf` for vision).
+
+Recommended run (262144 context, mmproj, MTP):
+
+```sh
+llama-kvmem-server.exe -m Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf --mmproj mmproj-Qwen3.8-27B-BF16.gguf --no-mmproj-offload --image-min-tokens 1024 --device CUDA0 -c 262144 --kvmem-budget 60240 --kvmem-gen-reserve 10240 -ngl 99 -fa on -ctk q8_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2 -b 2048 -ub 1024 --enable-thinking --reasoning-budget 10240 --reasoning-effort low --top-k 20 --temperature 0.5 --repetition-penalty 1 --kvmem-swap-ui --kvmem-conversations 16 --kvmem-conversations-gb 16
+```
+
+The rest of this file is the upstream llama.cpp documentation.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

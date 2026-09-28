@@ -4,7 +4,7 @@
 以及 llama.cpp 侧 KVMem patch 的来源与合并历史。构建命令和运行参数在最后。
 `kvmem-llama.cpp` 是独立的外部项目, 两个仓库各有自己的上游, 见 1.1 节 (最容易搞错的地方)。
 
-日期: 2026-09-26; 1.1 节、5 节、7.2 末尾与 7.11-7.14 在 2026-09-28 补过。当前分支: 本仓库 `kvmem`。
+日期: 2026-09-26; 1.1 节、5 节、7.1-7.2、7.11-7.14 与第 8 节在 2026-09-28 补过。当前分支: 本仓库 `kvmem`。
 
 ## 1. 现在的结构
 
@@ -103,7 +103,7 @@ git submodule add https://github.com/kvmem/kvmem-llama.cpp.git kvmem-llama.cpp
 再传 `-DLLAMA_KVMEM_ROOT=...` (旧命令里那个路径已经被移除, 传了反而会因路径不存在而报错):
 
 ```bat
-cd E:\build\llama.cpp-kvmem\build
+cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=ON ^
   -DCMAKE_CUDA_ARCHITECTURES=native -DGGML_CUDA_FA_ALL_QUANTS=ON -DLLAMA_KVMEM=ON
 
@@ -120,6 +120,7 @@ cmake --build . --config Release -j 5
 - 产物: `build/bin/Release/{llama-kvmem-server.exe, llama.dll, llama-common.dll, kvmem.dll, ...}`;
   `build/kvmem-from-llama/` 是子模块 kvmem 库在本仓库 build 目录下的 binary dir。
 - 环境: CUDA 12.4 / MSVC 19.44 / CMake 4.4.3; 本机 `CMAKE_CUDA_ARCHITECTURES=native` (= V100 sm_70)。
+- V100 16 GiB 的推荐模型与日常运行参数见第 8 节。
 
 ## 4. 运行 (llama-kvmem-server)
 
@@ -193,7 +194,7 @@ KVMEM_TRACE gen_exceed policy=retrieval rows=3456..3457 resident=1152 mandatory=
 ## 5. 单测
 
 ```bat
-cd E:\build\llama.cpp-kvmem\build
+cd build
 cmake --build . --config Release --target kvmem_store_test pinned_kv_tier_test -j 5
 build\bin\Release\kvmem_store_test.exe     :: 期望 OK
 build\bin\Release\pinned_kv_tier_test.exe  :: 期望 OK
@@ -256,11 +257,13 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
 
 ## 7. 注意事项与未完成项
 
-1. **子模块 pin 是本地提交**: 子模块 HEAD `f860546` (2026-09-28; 合并前是 `e152e59`, 更早是 `68fbc13`) 只存在于这台机器,
-   未推送到任何 remote。`git clone` 本仓库后 `git submodule update --init kvmem-llama.cpp`
-   会去 `https://github.com/kvmem/kvmem-llama.cpp.git` 找这个提交而失败。要分享或换机,
-   需要先把这些本地提交推到可访问的 remote (自己的 fork / 分支), 必要时改 `.gitmodules`
-   的 url。**没有 push, 这是有意的。**
+1. **子模块 pin 的来源**: 子模块 HEAD `04cba63` (2026-09-28 的 docs 提交; 之前是 `f860546`, 更早是 `e152e59` / `68fbc13`)
+   已在 2026-09-28 推送到自己的 fork `https://github.com/kikoqiu/kvmem-llama.cpp` 的 `master`。
+   这是 force push: 推送前那个 fork 的 `master` 是上游的 `b8ad6ded` (PR #81/#83 合完的状态),
+   那些提交在上游仓库 (`kvmem/kvmem-llama.cpp`) 里仍然存在, 下次合上游会重新进入本地历史。
+   父仓库 `.gitmodules` 的 url 还指向 `https://github.com/kvmem/kvmem-llama.cpp.git`, 那里没有这个提交,
+   所以新克隆后 `git submodule update --init kvmem-llama.cpp` 会失败; 换机时要么把 url 改成 fork,
+   要么用 `-DLLAMA_KVMEM_ROOT=<本地子模块目录>` 指过去。
 2. 子模块的本地 `master` 领先它自己的 `origin/master` (数字见本项末尾的 "上游现状"); 并且本轮把它的 `.gitmodules`
    改成空文件 (原来记录 `llama.cpp` 子模块)。从上游 `git pull` 会重新带回那个条目,
    建议把这些提交放到自己的分支上维护, 而不是继续直接堆在 `master`。
@@ -273,12 +276,12 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    **上游现状 (2026-09-28 合完)**: 子模块已 fetch 并把自己的 `origin/master` (`95a2155b`) 合进本地
    `master`, 结果是 merge 提交 `f860546` (合并前状态 `e152e59` 打了 tag `kvmem-sub-premerge-20260928`),
    父仓库 pin 已按上面的 cacheinfo 做法更新到 `f860546`。上一状态那 8 个本地提交现在是这个 merge 的
-   第一个 parent, 仍在历史里, 但没有 push, 依旧只存在于这台机器上 (见 7.1)。
+   第一个 parent, 仍在历史里; 这些提交已在 2026-09-28 随 fork 一起 push 出去 (见 7.1)。
 3. 子模块不再自带 llama.cpp, 所以 kvmem 仓库不能再用 `KVMEM_BUILD_LLAMA=ON` 独立构建
    (要独立构建需自己恢复那个嵌套子模块)。
 4. `temp/` 目录仍是 scratch, 不参与版本管理 (`temp/kvmem-merge-notes.md` 是旧记录,
-   新的权威说明就是本文档; 冒烟脚本 `temp/_pq_smoke.ps1` 可复跑)。
-5. 临时显存优化 A/B (2026-09-27, 未提交; 脚本 `temp/_tmpbuf_ab.ps1`, 日志 `temp/_tmpb_*.log`):
+   新的权威说明就是本文档; 冒烟脚本也放在 `temp/` 下, 未入库, 可复跑)。
+5. 临时显存优化 A/B (2026-09-27, 未提交; 脚本与日志都在本地 `temp/` 下, 未入库):
    24k prompt + budget 20480 (触发 retrieval) + 27B IQ3 + `-ctk q8_0 -ctv q4_0` + ub 1024 上,
    默认组 / 四个开关全关组 / 强制 1 块 spare 组 / 强制 trim 组 的 `content_sha` 完全相同;
    staging 峰值 226 MiB + 64 MiB; layout scratch: 旧 60 块 -> 新 29 块 (stride 208 KiB),
@@ -293,7 +296,7 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    回答正确。真实漂移收敛量需要在 27B + mmproj 的大池配置 (如
    `--kvmem-budget 60000 --kvmem-gen-reserve 20480 -c 262144`) 上按同一对话
    "KV 保留 vs KV 丢弃重 prefill" 对比。
-7. gen_reserve 超限验证 (2026-09-26, 脚本 `temp/_gen_exceed_smoke.ps1`, 27B IQ3 V100):
+7. gen_reserve 超限验证 (2026-09-26, 本地 scratch 脚本, 27B IQ3 V100):
    - `--kvmem-gen-exceed retrieval` + `--kvmem-gen-reserve 128` + `max_tokens 300`:
      `KVMEM_STARTUP ready` 里 `generation_limit=16384` (等于 `-c`), `default_max_tokens=128`;
      日志出现 `KVMEM_TRACE gen_exceed policy=retrieval rows=3456..3457 resident=1152
@@ -301,7 +304,7 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
      且输出 300 token (超过 reserve), 无 `no free GPU slot` / `llama_decode failed`。
    - `--kvmem-gen-exceed error`: `generation_limit=128`, 请求被夹到 `content_len=128`,
      日志无 `gen_exceed` 行, 旧行为保持。
-   - 换池对象确认 (`temp/_gen_exceed_summary.ps1` 解析同一个 log, `--kvmem-budget 1024
+   - 换池对象确认 (用本地 scratch 脚本解析同一个 log, `--kvmem-budget 1024
      --kvmem-gen-reserve 128`, `max_tokens 600`, prompt 3268 token -> 本轮从 block 26 起):
      ```
      --- swap 1 rows=3456..3457 ---
@@ -325,7 +328,7 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    `generation_limit=8192 default_max_tokens=1024`; 省略 `max_tokens` -> 200,
    `max_tokens=512` -> 200, `max_tokens=8192` -> 200 (夹到 8151); 用户原配置
    (`-c 262144 --kvmem-budget 50000 --kvmem-gen-reserve 20480 --api-key ...`, CUDA1 + mmproj + MTP)
-   上"你好" -> 200。脚本 `temp/_chat_hello.ps1`。`--kvmem-gen-exceed error` 行为不变
+   上"你好" -> 200 (本地 scratch 脚本)。`--kvmem-gen-exceed error` 行为不变
    (`default_max_tokens=128` 等于 reserve, 无换池行, 请求夹到 128)。
 9. Stage 5 Q capture 窗口 (2026-09-27, 子模块提交 `30c4183`): harvest staging slot 原来按
    `K + Q` 定尺寸 (24k / `-ub 1024` 实测 226 MiB, K-only ubatch 是 64 MiB), 现在 `d2h_submit`
@@ -339,7 +342,7 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    编译通过 (`llama-kvmem-server`), `kvmem_store_test` / `kvmem_runtime_test` OK; T0/T0s/T1/T2/T5
    门禁未跑, 需要按 `kvmem-llama.cpp/docs/prefill-harvest-optimization.md` 的 Stage 5 表在
    5050 / 5090 上执行。父仓库 pin 已同步 (做法见 §7.2)。
-10. 默认输出改为整个池 (2026-09-27, 子模块提交 `e152e59`, 本地未 push): 上一版把 retrieval 的 `generation_limit` 提升到
+10. 默认输出改为整个池 (2026-09-27, 子模块提交 `e152e59`, 已随 7.1 的 fork push 出去): 上一版把 retrieval 的 `generation_limit` 提升到
    `-c`, 但请求省略 `max_tokens` 时默认输出仍回落到 `gen_reserve` (注释原文 "An omitted max_tokens keeps
    the recipe's reserve as the output default")。现在默认输出按模式取值: `--kvmem-gen-exceed retrieval` =
    `budget + gen_reserve` (整个池, 再被 `-c` 夹紧), `error` = `gen_reserve`, 未开 KVMem 或
@@ -383,10 +386,54 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
       `tools/kvmem-responses-stream.cpp` (不加就是 4 个 `kvmem_responses_*` 的 LNK2019)。
 13. 本轮验证 (2026-09-28): `cmake --build . --config Release --target llama-kvmem-server` 0 error;
     `kvmem_store_test` / `pinned_kv_tier_test` = OK; 27B IQ3 (V100 16 GiB, `--kvmem-budget 1024
-    --kvmem-gen-reserve 512`, `temp/_pq_smoke.ps1`) 冒烟通过, 回答 `APPLE-11`, trace 仍是
+    --kvmem-gen-reserve 512`, 本地 scratch 脚本) 冒烟通过, 回答 `APPLE-11`, trace 仍是
     `policy=retrieval q_rows=13 spans=2`。
 14. 本仓库 (llama.cpp 侧) 这一轮还没合上游: HEAD `b52ebb728` (tag `kvmem-premerge-20260928`) 落后
     `origin/master` (`136887b66`, 2026-09-27) 68 个提交, 上次合上游是 `d39e9df12` (2026-09-25)。
     下一步按 1.1 节的顺序做本仓库的 merge (冲突面见第 6 节), 合完重跑 13 的验证。
+
+## 8. 实验 fork 的定位与推荐配置 (2026-09-28)
+
+本 fork 的实验目标只有一个: 把 **V100 16 GiB (sm_70)** 压到极限。
+
+- 性能优先: 小 context 下做到 **1000+ t/s prefill** 与 **60+ t/s decode**。
+- 长 context: 用 KVMem 的有界 GPU KV 工作集 + host 存储, 在 16 GiB 上跑 **260k+ context**。
+- remote:
+  - 本仓库 (llama.cpp 侧 patch): `git@github.com:kikoqiu/llama.cpp-kvmem.git`, 分支 `kvmem`。
+  - 子模块 (host 策略 + adapter + server): `https://github.com/kikoqiu/kvmem-llama.cpp`, 分支 `master`。
+  - 上游: llama.cpp = 本仓库 `origin`; kVMem = 子模块自己的 `origin` (见 1.1 节)。
+
+推荐编译 (CUDA, 在 build 目录里):
+
+```bat
+cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_NATIVE=ON ^
+  -DCMAKE_CUDA_ARCHITECTURES=native -DGGML_CUDA_FA_ALL_QUANTS=ON -DLLAMA_KVMEM=ON
+cmake --build . --config Release -j 5
+```
+
+推荐模型: **`Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf`** (视觉再配 `mmproj-Qwen3.8-27B-BF16.gguf`)。
+
+推荐运行参数 (262144 context + mmproj + MTP, V100 16 GiB):
+
+```bat
+llama-kvmem-server.exe -m Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf ^
+  --mmproj mmproj-Qwen3.8-27B-BF16.gguf --no-mmproj-offload --image-min-tokens 1024 ^
+  --device CUDA0 -c 262144 --kvmem-budget 60240 --kvmem-gen-reserve 10240 ^
+  -ngl 99 -fa on -ctk q8_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2 ^
+  -b 2048 -ub 1024 ^
+  --enable-thinking --reasoning-budget 10240 --reasoning-effort low ^
+  --top-k 20 --temperature 0.5 --repetition-penalty 1 ^
+  --kvmem-swap-ui --kvmem-conversations 16 --kvmem-conversations-gb 16
+```
+
+- `--kvmem-budget 60240 --kvmem-gen-reserve 10240`: 块表池 `budget + gen_reserve` (128 token / 块),
+  `-c 262144` 是 llama.cpp 侧的上下文上限; 4 个 KV dtype 走 `-ctk q8_0 -ctv q4_0` (需要 `-fa on`)。
+- `--kvmem-conversations-gb 16`: `--kvmem-session-ram-gb` 的别名, host RAM 里的会话缓存上限;
+  `--kvmem-conversations 16` 是会话条数上限。
+- `--kvmem-swap-ui`: 打开 swap-status 页面; `--spec-type draft-mtp --spec-draft-n-max 2`: MTP 推测解码 (draft KV 为 F16)。
+- `--repetition-penalty 1`: `llama-kvmem-server` 自己认这个别名 (`--repeat-penalty` 是上游的写法,
+  upstream `common/arg.cpp` 里没有 `--repetition-penalty`, 只有 kvmem server 的 chat-sampling 路径认它)。
+- `--reasoning-effort low` + `--reasoning-budget 10240`: 思考预算按 token 计, 想直接出答案可以调到更低。
+
 
 
