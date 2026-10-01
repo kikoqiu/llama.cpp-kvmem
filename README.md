@@ -41,7 +41,7 @@ Recommended model: `Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf` (plus `mmproj-Qwen3.8-27B-
 Recommended run (262144 context, mmproj, MTP):
 
 ```sh
-llama-kvmem-server.exe -m Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf --mmproj mmproj-Qwen3.8-27B-BF16.gguf --no-mmproj-offload --image-min-tokens 1024 --device CUDA0 -c 262144 --kvmem-budget 60240 --kvmem-gen-reserve 10240 -ngl 99 -fa on -ctk q8_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2 -b 2048 -ub 1024 --enable-thinking --reasoning-budget 10240 --reasoning-effort low --top-k 20 --temperature 0.5 --repetition-penalty 1 --kvmem-swap-ui --kvmem-conversations 16 --kvmem-conversations-gb 16
+llama-kvmem-server.exe -m Qwen3.8-27B-GSQ-RCO-IQ3_XXS.gguf --mmproj mmproj-Qwen3.8-27B-BF16.gguf --no-mmproj-offload --image-min-tokens 1024 --device CUDA0 -c 262144 --kvmem-budget 60240 --kvmem-gen-reserve 10240 -ngl 99 -fa on -ctk q8_0 -ctv q4_0 --spec-type draft-mtp --spec-draft-n-max 2 -b 2048 -ub 1024 --enable-thinking --reasoning-budget 10240 --reasoning-effort low --top-k 20 --kvmem-swap-ui --kvmem-conversations 16 --kvmem-conversations-gb 16
 ```
 
 The rest of this file is the upstream llama.cpp documentation.
