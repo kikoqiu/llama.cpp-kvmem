@@ -4,7 +4,7 @@
 以及 llama.cpp 侧 KVMem patch 的来源与合并历史。构建命令和运行参数在最后。
 `kvmem-llama.cpp` 是独立的外部项目, 两个仓库各有自己的上游, 见 1.1 节 (最容易搞错的地方)。
 
-日期: 2026-09-26; 1.1 节、5 节、7.1-7.2、7.11-7.14 与第 8 节在 2026-09-28 补过。当前分支: 本仓库 `kvmem`。
+日期: 2026-09-26; 1.1 节、5 节、7.1-7.2、7.11-7.14 与第 8 节在 2026-09-28 补过; 5 节、6 节、7.2 与 7.15-7.16 在 2026-10-02 补过。当前分支: 本仓库 `kvmem`。
 
 ## 1. 现在的结构
 
@@ -203,9 +203,10 @@ build\bin\Release\pinned_kv_tier_test.exe  :: 期望 OK
 `kvmem_store_test` 覆盖 prefill 压力的 recency 旧契约、新的分数选择、`recent_blocks` 后缀钉住、
 mandatory(incoming) 必须留在预算内, 以及压力预算独立于语义预算。
 
-Windows 上只有 `kvmem_store_test` / `pinned_kv_tier_test` 有 target: 子模块 `kvmem/CMakeLists.txt`
-把 `nvme_kv_tier_test` / `kvmem_runtime_test` / `raw_kv_store_test` 归为 POSIX-only (走 unistd.h 与
-/tmp), 在 Windows 上直接跳过。`build/bin/Release/kvmem_runtime_test.exe` 是以前留下的产物,
+Windows 上只有 `kvmem_store_test` / `pinned_kv_tier_test` / `backend_rebind_test` 有 target: 子模块
+`kvmem/CMakeLists.txt` 把 `nvme_kv_tier_test` / `kvmem_runtime_test` / `raw_kv_store_test` 归为 POSIX-only
+(走 unistd.h 与 /tmp), 在 Windows 上直接跳过 (`backend_rebind_test` 是 2026-10-02 合上游时进来的, 只用标准头,
+Windows 也能编)。`build/bin/Release/kvmem_runtime_test.exe` 是以前留下的产物,
 不是本仓库现在能编出来的 target。
 
 ## 6. patch / merge 历史 (本仓库 `kvmem` 分支)
@@ -222,6 +223,8 @@ Windows 上只有 `kvmem_store_test` / `pinned_kv_tier_test` 有 target: 子模�
 | `6b2c22f1c` | `kvmem : fix Windows link against the kvmem library` (`WINDOWS_EXPORT_ALL_SYMBOLS`) |
 | `bb57e9065` | `kvmem : provision the chat UI for llama-kvmem-server` |
 | `c4a4101ff` | `kvmem : track kvmem-llama.cpp as a submodule` (本文档的这次反转) |
+| `5dcee9f18` | `kvmem : pin the submodule upstream merge` (子模块合自己上游后的 pin; 见 7.15) |
+| 本轮 HEAD | `kvmem : replay the submodule patch set onto the newer llama.cpp` (v0.5.0 基线重写的 `llama-kvmem-current.patch`, 加 cuda-graph-decode / reactivation / gdn-output-fusion / RDNA2; 见 7.16) |
 
 合并时的 4 个冲突与处理方式:
 
@@ -281,6 +284,9 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
    tag `v0.17.0`) 并合进本地 `master`, 得到 merge 提交 `aa61c90`。上游这轮带进来的是 v0.17.0 发版说明、
    PR #81 (session cache 目录回收, 新增 `tools/kvmem-session-cache-dir.h`) 和 PR #83 (server 链接 `kvmem`)。
    冲突只有 `README.md` 一处 (clone 块): 保留本仓库的独立 `llama.cpp` 克隆写法, 版本号跟上游改成 `v0.17.0`。
+   **上游现状 (2026-10-02 第三轮)**: 再 fetch 上游 `master` (`659c7b4`, 33 个提交) 并合进本地 `master`,
+   得到 merge 提交 `060b26a` (另加 `b546a3a`); 冲突 5 个文件 12 处, 处理方式与新 pin 见 7.15。
+   父仓库 pin 提交 `5dcee9f18`, 子模块侧这一轮的 llama.cpp patch 也在同一天重放进本仓库, 见 7.16。
 3. 子模块不再自带 llama.cpp, 所以 kvmem 仓库不能再用 `KVMEM_BUILD_LLAMA=ON` 独立构建
    (要独立构建需自己恢复那个嵌套子模块)。**2026-09-28 起更彻底**: 子模块只放源码, 一律由父仓库构建
    (`LLAMA_KVMEM_ROOT` 直接编 `src/adapter/*.cpp` 与 `tools/llama-kvmem-server.cpp`), 不要再在子模块目录里
@@ -397,6 +403,77 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
 14. 本仓库 (llama.cpp 侧) 这一轮还没合上游: HEAD `b52ebb728` (tag `kvmem-premerge-20260928`) 落后
     `origin/master` (`136887b66`, 2026-09-27) 68 个提交, 上次合上游是 `d39e9df12` (2026-09-25)。
     下一步按 1.1 节的顺序做本仓库的 merge (冲突面见第 6 节), 合完重跑 13 的验证。
+
+15. 子模块合自己的上游 (2026-10-02): 子模块本地 `master` (`67c6ea4`) 合入 `upstream/master`
+    (`659c7b4`, 33 个提交: llama.cpp v0.5.0 patch 迁移、GDN output fusion、CUDA graph decode /
+    reactivation、最多 4 lane 的动态推理、video input、responses 修复、CI 与文档), 得到 merge `060b26a`;
+    另加一个 2 行提交 `b546a3a` (把 `protect_system` / `prefill_query_max_tokens` 也拷给额外 lane,
+    否则 `--parallel > 1` 时 lane 1..3 用结构体默认值, `--no-kvmem-protect-system` 与
+    `--kvmem-prefill-query-max-tokens` 对它们无效)。备份 ref: tag `backup-pre-upstream-merge-20261002`
+    与分支 `backup/pre-upstream-merge-20261002` (都指向 `67c6ea4`)。冲突 5 个文件 12 处:
+    1. `src/adapter/llama-memory-kvmem.cpp` (2): 本地的 `prefill_method_` / `gen_exceed_` 保留, 但取值改从
+       上游新的 per-execution 域 `kvmem_current_execution().params.*` 读 (全局 `g_kvmem_params` 已被上游
+       删除, 再引用它编不过)。
+    2. `tools/llama-kvmem-server.cpp` (5): include 取并集; `st.recurrent_cache_valid = true` (上游) 与
+       `publish_swap_status(...)` (本地) 都留; `default_max_tokens` 用本地的整池默认, http threads 用
+       上游的 `http_workers`; 另两处**必须丢本地** - git 把 `st.active_prompt = parsed_prompt;` 与 query
+       span 推导当成两边各加了一次, `handle_chat` 里出现了两份, 而取 lane 之前 `st` 还是 lane 0 的状态,
+       所以保留 lane 之后 (上游) 的副本。该文件由此确定采用上游的 lane 结构。
+    3. `README.md` (4): 取并集 - 本地 `--kvmem-protect-system` / `--kvmem-gen-exceed` 行保留,
+       `--kvmem-conversations` 用上游含 `--parallel P` 的措辞; clone 流程保留本地"单独 clone llama.cpp"
+       的写法, pin 跟上游改成 `v0.5.0` (`7fe450e19`)。
+    4. `patches/README.md` (1): 同上, 保留本地 clone 写法, pin 改 `7fe450e19`。
+    5. `llama.cpp` gitlink: modify/delete, 维持本地删除嵌套子模块 (`git rm --cached`)。
+    自动合并的其它大文件 (`llama-kvmem-stagein.cu/h`、`llama-kvmem-hooks.h`、`llama-memory-kvmem.h`、
+    `kvmem_runtime.*`) 无冲突。另做了一次"相邻重复行"扫描: 只命中 `patches/README.md` 里 apply-patches
+    那行的重复, 三个版本 (base/本地/上游) 都有, 是旧笔误, 未改。
+    父仓库 pin 提交 `5dcee9f18`。验证: configure + `cmake --build . --config Release -j 5` 0 error;
+    `kvmem_store_test` / `pinned_kv_tier_test` OK, `backend_rebind_test` (上游新增) 0;
+    27B IQ3 + mmproj (`-c 262144 --kvmem-budget 60240 --kvmem-gen-reserve 10240` + MTP + swap-ui)
+    两轮问答 (APPLE-11 / BANANA-7) 正确, 第二轮 `cache_n=40`, `GET /kvmem/swap/status` 200。
+    已知限制: swap 状态页只读 lane 0 的 publisher, `--parallel > 1` 时跑在其它 lane 上的请求不会刷新
+    页面 (上游 lane 化带来的, 本轮未扩大范围修)。
+
+16. patch 重放到本仓库 llama.cpp (2026-10-02): 子模块这轮的 patch 集 (`llama-kvmem-current.patch` 针对
+    v0.5.0 基线重写, 另有 `cuda-graph-decode.patch`、`cuda-graph-reactivation.patch`、
+    `gdn-output-fusion.patch`、`0005-hip-rdna2-quantized-kv-fa-vec.patch`) 在此之前只存在于子模块文件里,
+    父仓库的 llama.cpp 没有生效。**不要**对已打补丁的树直接 `git apply` / `apply-patches.sh` (脚本只认干净
+    pin), 用 git 做三方重放:
+    1. `git worktree add -b kvm-patch-pin-20261002 e:\build\kvm-patch-pin 7fe450e19` (`7fe450e19` = llama.cpp
+       v0.5.0, 也是 HEAD 的祖先, 所以 merge base 正好是它);
+    2. 在 worktree 里按 `scripts/apply-patches.sh` 的顺序依次 `git apply` 那 5 个 patch (47 个文件,
+       +1076/-150), 提交 `a66eae438`;
+    3. 父仓库 master 先备份 (`backup/pre-patch-replay` = `5dcee9f18`), 再 `git merge kvm-patch-pin-20261002`。
+    冲突 11 个文件 26 处, 分三类。(a) 本地 = 更新过的上游 API, 取本地: `common/speculative.cpp` (11, 本地已是
+    `common_batch` 类 API)、`src/llama-batch.cpp/h` (3, 本地是 `n_embd_st` 宽度 + `llama_batch_ext`)、
+    `src/llama-kv-cache.cpp/h` (2, 本地是带缓存 + `KVMEM_MASK_SHORTCUT` / `KVMEM_MASK_VERIFY` 的 holes 变体;
+    `get_stream` 被 `llama-memory-hybrid-idx.cpp` 调用, 声明必须留)、`tools/mtmd/mtmd-helper.cpp` (1, 本地是
+    `llama_process` / `get_legacy_view`)、`tools/server/server-common.cpp` (2, 本地 helper 已含 video 与校验)。
+    (b) 本地接线取本地: `CMakeLists.txt` (1, `LLAMA_KVMEM_ROOT` 默认指向子模块)、`src/CMakeLists.txt` (2,
+    子模块源码检查 + `WINDOWS_EXPORT_ALL_SYMBOLS`)。(c) 取补丁: `src/llama-context.cpp` 第 1 处 (新的
+    `shape_ok` + `llama_kvmem_capture_stamp()` 校验), 同文件另两处仍取本地 (等价的
+    `gtype == LLM_GRAPH_TYPE_DECODER_MTP` 写法、本地 `KVMEM_STAGE` 分段计时); `ggml/src/ggml-cuda/norm.cuh`
+    取并集 (`rms_norm_scale_fused` 与 GDN 的 `rms_norm_silu_gate` 都要, `norm.cu` 两个都已定义)。
+    逐 hunk 取本地还不够: 自动合并把 `tools/server/server-common.cpp` 合出了**两份**
+    `oaicompat_chat_params_parse` (必然重定义), 又往 `common/speculative.cpp` 塞进两段 v0.5.0 老 API
+    (`llama_batch sync_batch = batch;` 之类, 编不过); 这两个文件整份回到本地版本 (本地已含改写后的等价实现)。
+    判别方法: 取完本地后看 `git diff --cached`, 老 API 的 `+` 行会露出来。
+    净改动 10 个文件 +320/-18: `ggml/include/ggml-backend.h`、`ggml/src/ggml-backend.cpp` (scheduler src
+    还原)、`ggml-cuda.cu`、`norm.cu/cuh`、`getrows.cu`、`fattn.cu`、`llama-context.cpp/h` (每宽度 decode
+    graph slot + capture stamp)、`models/qwen35.cpp` (GDN 输出融合)。`getrows.cu` 与 `fattn.cu` 的改动分别是
+    空 `GET_ROWS` 直接 return 与 RDNA2 fattn 分派 (后者在 CUDA 上不生效, 只是跟着补丁一起进来)。
+    校验: 把 5 个 patch 的新增行逐条回查树, 只有刻意否掉的旧 API 变体"缺失"; `cuda-graph-decode` 的
+    `else if (shape_ok)` 分支在"pin + 全补丁"树里同样没有 (被 reactivation 取代), 不是漏合; 二进制字符串
+    确认代码真进去了 - `llama.dll` 含 `fixed-width decode graph slots`、`KVMEM_DECODE_GRAPH_SLOTS`、
+    `llama_kvmem_capture_stamp`, `ggml-base.dll` 含 `restore_graph_srcs`, `ggml-cuda.dll` 含
+    `rms_norm_silu_gate`。编译 0 error; 三个单测通过; 27B + mmproj 冒烟 3 次请求 (APPLE-11 / BANANA-7 /
+    155 token 计数题全对, decode 62.1 t/s), 无 error、无 `no free GPU slot`。
+    结果是本轮 HEAD 这个 merge 提交 (双亲 `5dcee9f18` + `a66eae438`); 分支 `kvm-patch-pin-20261002` 与
+    worktree `e:\build\kvm-patch-pin` 保留作重放来源 (不用了可 `git worktree remove e:\build\kvm-patch-pin`,
+    分支会留着)。补丁自带的新开关 (默认都开): GDN 输出融合 `KVMEM_GDN_OUT_FUSION=0` 关、
+    `KVMEM_GDN_OUT_FUSION_TRACE=1` 打点; decode graph slot `KVMEM_DECODE_GRAPH_SLOTS=0` 关
+    (那行 `fixed-width ...` 是 libllama 的 INFO 日志, 默认 verbosity 下不进 server 日志)。
+    上游以后再改 patch 集时, 按本节 1-3 重建 pin + patch 分支再 merge 一遍即可, 不要直接 apply。
 
 ## 8. 实验 fork 的定位与推荐配置 (2026-09-28)
 

@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include <cstdlib>
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -245,6 +246,10 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
+    static const bool fuse_output = !std::getenv("KVMEM_GDN_OUT_FUSION") || std::atoi(std::getenv("KVMEM_GDN_OUT_FUSION"));
+    if (fuse_output) {
+        ggml_build_forward_expand(gf, gate);
+    }
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
@@ -280,6 +285,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
+    kvmem_capture_q(Qcur, il);
 
     kvmem_capture_q(Qcur, il);
 
