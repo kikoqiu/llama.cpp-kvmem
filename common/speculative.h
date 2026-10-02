@@ -78,7 +78,10 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+bool common_speculative_process(common_speculative * spec, const common_batch & batch);
+
+// same, for a legacy llama_batch built by hand (the extended logical_pos/embd_nextn arrays are carried over)
+bool common_speculative_process(common_speculative * spec, const struct llama_batch & batch);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
