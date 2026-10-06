@@ -4533,7 +4533,7 @@ static void ggml_cuda_graph_account(bool direct, bool capture, bool launch, bool
     }
     const uint64_t calls = n_calls.fetch_add(1, std::memory_order_relaxed) + 1;
     const uint64_t launches = n_launch.load(std::memory_order_relaxed);
-    if ((launch && launches == 1) || calls % 128 == 0) {
+    if ((launch && launches == 1) || calls % 4096 == 0) {
         fprintf(stderr,
                 "GGML_CUDA_GRAPH direct=%llu capture=%llu launch=%llu reset=%llu incompatible=%llu\n",
                 (unsigned long long) n_direct.load(std::memory_order_relaxed),
