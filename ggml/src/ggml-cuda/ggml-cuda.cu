@@ -4330,6 +4330,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// KVMEM_CUDA_GRAPH_TRACE=1: log the graph entry that is captured and the entry that
+// is instantiated. If the two differ the entry was evicted and recreated in between.
+static bool kvmem_graph_trace() {
+    static const bool on = getenv("KVMEM_CUDA_GRAPH_TRACE") != nullptr;
+    return on;
+}
+
+static thread_local const void * kvmem_capture_entry = nullptr;
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4537,6 +4546,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
+            if (kvmem_graph_trace()) {
+                fprintf(stderr, "KVMEM_CUDA_GRAPH capture key=%p entry=%p graph=%p cgraph_nodes=%d uid=%llu pending=%s\n",
+                        graph_key, (const void *) graph, (const void *) graph->graph, cgraph->n_nodes,
+                        (unsigned long long) cgraph->uid, cudaGetErrorString(cudaPeekAtLastError()));
+                fflush(stderr);
+            }
+            kvmem_capture_entry = (const void *) graph;
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
             if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
@@ -4549,6 +4565,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        if (kvmem_graph_trace() && (cuda_graph_update_required || graph->instance == nullptr)) {
+            fprintf(stderr, "KVMEM_CUDA_GRAPH launch key=%p entry=%p capture_entry=%p graph=%p inst=%p upd=%d warmup=%d cgraph_nodes=%d uid=%llu pending=%s\n",
+                    graph_key, (const void *) graph, kvmem_capture_entry, (const void *) graph->graph,
+                    (const void *) graph->instance, (int) cuda_graph_update_required, (int) graph->warmup_complete,
+                    cgraph->n_nodes, (unsigned long long) cgraph->uid, cudaGetErrorString(cudaPeekAtLastError()));
+            fflush(stderr);
+        }
+        kvmem_capture_entry = nullptr;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
         }
@@ -4637,6 +4661,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    // hold the entry for the whole compute: the eviction sweep runs inside
+    // cuda_graph() and must not destroy a graph that is still being used
+    graph->in_use = true;
+
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
@@ -4688,6 +4716,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+#ifdef USE_CUDA_GRAPH
+    // release the entry so the eviction sweep can reclaim it again
+    cuda_ctx->cuda_graph(graph_key)->in_use = false;
+#endif
 
     return GGML_STATUS_SUCCESS;
 }

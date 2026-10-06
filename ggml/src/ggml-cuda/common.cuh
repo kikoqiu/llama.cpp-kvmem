@@ -1275,6 +1275,9 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // set while a graph compute holds this entry; the eviction sweep must not destroy it
+    bool in_use = false;
+
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1469,7 +1472,9 @@ struct ggml_backend_cuda_context {
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                // never evict an entry a graph compute is holding: erasing it would
+                // destroy the captured graph while the caller still uses the entry
+                if (!it->second->in_use && time_now - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
