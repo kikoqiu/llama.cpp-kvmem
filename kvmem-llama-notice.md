@@ -228,6 +228,8 @@ Windows 也能编)。`build/bin/Release/kvmem_runtime_test.exe` 是以前留下�
 | `8e384918d` | `kvmem : drop the duplicate Q capture and calm the graph-account log` (2026-10-06; 删掉 `32ff39642` 三方 merge 引入的重复 `kvmem_capture_q`, graph 记账日志 128 -> 4096 次, 并记录子模块 `3b1c5db`) |
 | `1cfffcb7e` | `kvmem : pin the submodule upstream merge` (子模块合自己上游 `d012492` 后的 pin, 见 7.17) |
 | 本轮 HEAD `d75aefc8e` | `Merge upstream master into the local fork` (上游 `b9a5a00b8` = tag `b11436`, 77 提交, `v0.5.0` -> **`v0.6.0`**; 冲突 6 文件 8 处, 处理方式见 7.17) |
+| `567b47f7f` | `kvmem : keep the CUDA graph entry alive while a compute holds it` (2026-10-06; 修 CUDA graph evict 崩溃, 机制与验证见 7.18) |
+
 
 合并时的 4 个冲突与处理方式:
 
@@ -510,6 +512,29 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
     - 已知遗留: 上游把 `GGML_CUDA_FA_ALL_QUANTS` 标记废弃, 建议改传 `GGML_CUDA_FA_QUANTS=all`
       (旧名本次仍生效, 只是 configure 时打一条 warning)。上游还新增了 `GGML_CUDA_FA_QUANTS`、
       决策类模型 (`clef`/`lev`/`nimble`)、`/v1/systemone`、mixed token/embd batch、MTP/simple draft 的概率采样等。
+
+18. **"跑着跑着停" 的 CUDA graph 崩溃: 真身抓到并修掉 (2026-10-06, 父仓库提交 `567b47f7f`)**。
+    症状: decode 生成中途长时间静止 (用户那次 `n_gen = 1746` 后停了 2m36s), 然后报
+    `cudaGraphInstantiate(&graph->instance, graph->graph, 0, 0, 0) ... invalid argument`,
+    位置 `ggml_cuda_graph_evaluate_and_capture` (行号对得上本 fork 树)。
+    - **机制**: `ggml_backend_cuda_context::cuda_graph()` 里的 evict 扫描 (上游代码: 每 5s 一次,
+      回收闲置 >=10s 的条目) 会**把调用者仍在用的条目销毁**。`evaluate_and_capture` 在捕获段取一次
+      条目 (D), `cudaStreamEndCapture` 之后再取一次 (F) 用来 instantiate。若 D -> F 之间耗时 >= 10s
+      (大图 `cudaStreamEndCapture` 慢, 或线程被挂起 / KVMem 停顿), F 处这次取就会把刚捕获的条目 erase
+      掉并新建一个空条目, 于是 `graph->graph == NULL`, instantiate 返回 `invalid argument`。
+      跟踪日志的特征: capture 的 `entry` 与 launch 的 `entry` 不同, 且 launch 行 `warmup=0`。
+    - **复现**: 在 D 与 F 之间插入可配置停顿 (调试脚手架 `KVMEM_GRAPH_STALL_MS=11000`) 必现;
+      修好后该开关已删除。
+    - **修法**: `ggml_cuda_graph` 加 `bool in_use`; evict 扫描跳过 `in_use` 的条目;
+      `ggml_backend_cuda_graph_compute()` 取到条目后置 `in_use = true`, 函数返回前置回 `false`。
+      条目照旧按空闲回收, 但**不会在图计算进行中被销毁**。
+    - **验证**: 同一停顿实验不再崩溃 (capture/launch 的 `entry` 恒相同、`graph` 非空); 真机长生成
+      (34k prompt + 8500 token, 50 t/s) 无 error。
+    - **诊断开关**: 保留 `KVMEM_CUDA_GRAPH_TRACE=1` (打印 capture / launch 两行:
+      key/entry/capture_entry/graph/inst/upd/warmup/uid/pending)。本会话定位用的实验开关
+      `KVMEM_GRAPH_KEY_UID` / `KVMEM_CUDA_GRAPH_NO_EVICT` / `KVMEM_GRAPH_STALL_MS` 已删除。
+    - 复现脚本与日志在 `temp/repro/`、`temp/logs/g-*.log` (temp/ 未入库, 只作记录)。
+
 
 ## 8. 实验 fork 的定位与推荐配置 (2026-09-28)
 
