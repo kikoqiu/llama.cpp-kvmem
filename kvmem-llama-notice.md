@@ -224,7 +224,10 @@ Windows 也能编)。`build/bin/Release/kvmem_runtime_test.exe` 是以前留下�
 | `bb57e9065` | `kvmem : provision the chat UI for llama-kvmem-server` |
 | `c4a4101ff` | `kvmem : track kvmem-llama.cpp as a submodule` (本文档的这次反转) |
 | `5dcee9f18` | `kvmem : pin the submodule upstream merge` (子模块合自己上游后的 pin; 见 7.15) |
-| 本轮 HEAD | `kvmem : replay the submodule patch set onto the newer llama.cpp` (v0.5.0 基线重写的 `llama-kvmem-current.patch`, 加 cuda-graph-decode / reactivation / gdn-output-fusion / RDNA2; 见 7.16) |
+| `32ff39642` | `kvmem : replay the submodule patch set onto the newer llama.cpp` (v0.5.0 基线重写的 `llama-kvmem-current.patch`, 加 cuda-graph-decode / reactivation / gdn-output-fusion / RDNA2; 见 7.16) |
+| `8e384918d` | `kvmem : drop the duplicate Q capture and calm the graph-account log` (2026-10-06; 删掉 `32ff39642` 三方 merge 引入的重复 `kvmem_capture_q`, graph 记账日志 128 -> 4096 次, 并记录子模块 `3b1c5db`) |
+| `1cfffcb7e` | `kvmem : pin the submodule upstream merge` (子模块合自己上游 `d012492` 后的 pin, 见 7.17) |
+| 本轮 HEAD `d75aefc8e` | `Merge upstream master into the local fork` (上游 `b9a5a00b8` = tag `b11436`, 77 提交, `v0.5.0` -> **`v0.6.0`**; 冲突 6 文件 8 处, 处理方式见 7.17) |
 
 合并时的 4 个冲突与处理方式:
 
@@ -474,6 +477,39 @@ KVMem patch 对 llama.cpp 的主要改动面 (便于日后 rebase 时定位):
     `KVMEM_GDN_OUT_FUSION_TRACE=1` 打点; decode graph slot `KVMEM_DECODE_GRAPH_SLOTS=0` 关
     (那行 `fixed-width ...` 是 libllama 的 INFO 日志, 默认 verbosity 下不进 server 日志)。
     上游以后再改 patch 集时, 按本节 1-3 重建 pin + patch 分支再 merge 一遍即可, 不要直接 apply。
+
+17. 父仓库再合上游 (2026-10-06): 上游 `origin/master` = `b9a5a00b8` (tag `b11436`, 含 `v0.6.0` 版本号提交
+    `d81235049`), 比 `8d81559fa` 多 77 个提交 (`v0.5.0` -> `v0.6.0`)。顺序按 1.1 节: 先子模块合自己的上游,
+    再记 pin, 最后父仓库合 llama.cpp 上游。
+    - 子模块: 上游 `d012492` 只有 4 个 README/docs 提交 (+22/-1), 自动合并得 merge `bc38f44` (父仓库 pin
+      `1cfffcb7e`); 本轮再留一个 `0b7eac0` (见下面的第 5 条), 最终 pin `d75aefc8e` 里记录。
+    - 父仓库: 77 个提交里与 fork 改动重叠的文件有 26 个, 实际冲突 6 个文件 8 处, 处理方式:
+      1. `src/llama-graph.h`: 本地的 `ubatch.n_pos` 比较 (v0.16.0-rc3 补丁带入) 与上游新加的
+         `ubatch.is_mixed()` 比较, 两行**都保留** (图复用判定更保守)。
+      2. `src/llama-batch.h` (2 处): `set_logical_pos` 与 `set_decision_order` 都留; `llama_batch_allocr` 的
+         `embd_nextn` / `logical_pos` 与上游的 `is_embd_vec` 都留。
+      3. `src/llama-batch.cpp` (2 处): `ubatch_add()` 取上游的 mixed-batch 版 (`mixed_batch` / `mixed` /
+         `use_token` / `use_embd`, `n_embd_all` 按 `use_embd` 取值), 再补回本地 `n_embd_st` / `n_embd_st_all`
+         两行; 文件末尾 `llama_batch_ext_set_logical_pos` 与 `llama_batch_ext_set_decision_order` 都留。
+      4. `common/common.h`: `common_batch::token` 的 `logical_pos` / `embd_state` / `decision_order` 三个字段都留
+         (`common.cpp` 的 `get_sub_batch()` 自动合并后已同时接线三者)。
+      5. `common/speculative.h`: 同样取并集, 但 `n_past_logical` **移到结构体末尾**。原因是上游
+         `tools/server/server-context.cpp` 用位置式聚合初始化 (`= { 9 个值 }`): 字段插在中间会让第 7 个值落到
+         `result_q` 上 (C2679, 首次编译就是这个错)。子模块 `tools/kvmem-spec.cpp` 跟着改成先填公共字段、
+         再 `dp.n_past_logical = n_past` (子模块提交 `0b7eac0`)。教训: 给上游结构体加字段时, 一律追加到末尾。
+      6. `ggml/src/ggml-cuda/mmvq.cu`: 上游 `bed0a8566` (shared experts 融合进 MMVQ) 在**调用点**把 grid y 加了
+         `+ (fusion.shared_up != nullptr)`; 本地 `46d210ed8` / `26b151640` / `b3f90d001` / `b5d4b8095`
+         (Pascal/Volta mmvq 参数表) 已把 launch grid 移进 `mul_mat_q_switch_fusion()` (那里才知道 `has_fusion`)。
+         取本地的调用形式, 把 `+ (fusion.shared_up != nullptr)` 移进函数内 `calc_launch_params<>()` 那一处;
+         其余 shared-experts 改动 (kernel 内 `shared_expert` 分支、`mul_mat_vec_q_moe_launch` 的 grid、
+         `ggml_cuda_mul_mat_vec_q` 的新断言) 已自动合入。
+    - 本次之前的未提交改动先落成两个提交: 父仓库 `8e384918d`, 子模块 `3b1c5db`。
+    - 验证: configure + `cmake --build . --config Release -j 5` 0 error (全套 target, 含
+      `llama-kvmem-server.exe`); `kvmem_store_test` / `pinned_kv_tier_test` OK, `backend_rebind_test` 0。
+      真机 27B + mmproj + MTP 冒烟本轮未跑 (下个会话做)。
+    - 已知遗留: 上游把 `GGML_CUDA_FA_ALL_QUANTS` 标记废弃, 建议改传 `GGML_CUDA_FA_QUANTS=all`
+      (旧名本次仍生效, 只是 configure 时打一条 warning)。上游还新增了 `GGML_CUDA_FA_QUANTS`、
+      决策类模型 (`clef`/`lev`/`nimble`)、`/v1/systemone`、mixed token/embd batch、MTP/simple draft 的概率采样等。
 
 ## 8. 实验 fork 的定位与推荐配置 (2026-09-28)
 
